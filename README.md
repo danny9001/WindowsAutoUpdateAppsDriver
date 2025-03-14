@@ -60,6 +60,7 @@ Este script crea una tarea programada que ejecuta `UpdateAppsDrivers3.ps1` todos
 
 ```powershell
 .\CreateTask.ps1
+.\UpdateAppsDrivers3.ps1
 ```
 
 3. Siga las instrucciones para ingresar la hora de ejecución de la tarea y la ubicación de la carpeta donde se copiará el script.
