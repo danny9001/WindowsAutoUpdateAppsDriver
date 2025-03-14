@@ -67,9 +67,9 @@ Este script crea una tarea programada que ejecuta `UpdateAppsDrivers3.ps1` todos
 ### Ejemplo
 
 ```powershell
-Ingrese la hora de ejecución de la tarea (formato 24 horas, ej. 14 para las 2 PM): 14
+Ingrese la hora de ejecución de la tarea (formato 24 horas, ej. 03 para las 3 AM, 14 para las 2 PM): 03
 Ingrese los minutos de ejecución de la tarea (ej. 30 para las 2:30 PM): 30
-Ingrese la ubicación y nombre de la carpeta donde se copiará el script (ej. C:\ScriptAutoUpdate): C:\ScriptAutoUpdate
+Ingrese la ubicación y nombre de la carpeta donde se copiará el script (ej. C:\ScriptAutoUpdate)
 ```
 
 ## Notas
