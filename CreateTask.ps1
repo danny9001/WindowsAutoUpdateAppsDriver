@@ -33,8 +33,14 @@ if (-not (Test-Path $logFolder)) {
 # Copiar el script UpdateAppsDrivers3.ps1 a la carpeta especificada
 $scriptSource = "$PSScriptRoot\UpdateAppsDrivers3.ps1"
 $scriptDestination = "$folderPath\UpdateAppsDrivers3.ps1"
-Copy-Item -Path $scriptSource -Destination $scriptDestination -Force
-Write-Host "Script UpdateAppsDrivers3.ps1 copiado a $folderPath" -Fore Green
+
+# Verificar que el destino no sea el mismo que el origen
+if ($scriptSource -ne $scriptDestination) {
+    Copy-Item -Path $scriptSource -Destination $scriptDestination -Force
+    Write-Host "Script UpdateAppsDrivers3.ps1 copiado a $folderPath" -Fore Green
+} else {
+    Write-Host "El script fuente y destino son iguales. No se puede copiar el script a sí mismo." -Fore Red
+}
 
 # Crear la tarea programada
 $taskName = "DailyUpdateAppsDrivers"
