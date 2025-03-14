@@ -87,11 +87,15 @@ function Update-RuckZuckApps {
     $latestVersion = "1.7.3.8"
 
     if (Test-Path $rzPath) {
-        $currentVersion = (& $rzPath --version).Split(" ")[-1]
-        if ($currentVersion -ne $latestVersion) {
-            Write-Host "RuckZuck no está actualizado. Descargando la última versión..." -Fore Yellow
-            Invoke-WebRequest -Uri $rzUrl -OutFile $rzPath
-            Write-Host "RuckZuck actualizado correctamente." -Fore Green
+        try {
+            $currentVersion = (& $rzPath --version).Split(" ")[-1]
+            if ($currentVersion -ne $latestVersion) {
+                Write-Host "RuckZuck no está actualizado. Descargando la última versión..." -Fore Yellow
+                Invoke-WebRequest -Uri $rzUrl -OutFile $rzPath
+                Write-Host "RuckZuck actualizado correctamente." -Fore Green
+            }
+        } catch {
+            Write-Host "Error al obtener la versión de RuckZuck: $_" -Fore Red
         }
     } else {
         Write-Host "RuckZuck no está instalado. Instalando RuckZuck..." -Fore Yellow
@@ -122,6 +126,7 @@ function Update-Drivers {
     $UpdatesToDownload = New-Object -Com Microsoft.Update.UpdateColl
     foreach ($Update in $SearchResult.Updates) {
         $UpdatesToDownload.Add($Update) | Out-Null
+        Write-Host "Encontrado controlador: $($Update.Title)" -Fore Cyan
         $progress++
         Write-Progress -Activity "Buscando drivers" -Status "$progress de $totalUpdates encontrados" -PercentComplete (($progress / $totalUpdates) * 100)
     }
@@ -157,6 +162,7 @@ function Update-Drivers {
         $UpdatesToDownload | ForEach-Object {
             if ($_.IsDownloaded) {
                 $UpdatesToInstall.Add($_) | Out-Null
+                Write-Host "Instalando controlador: $($_.Title)" -Fore Cyan
             }
         }
 
