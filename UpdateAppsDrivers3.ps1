@@ -18,65 +18,87 @@ function Is-Server {
 # Function to update Windows Store apps
 function Update-WindowsStoreApps {
     if (Is-Server) {
-        Write-Host "Sistema operativo detectado como servidor. Omitiendo actualizaciones de la Tienda Windows." -Fore Yellow
+        Write-Host "Sistema operativo detectado como servidor. Omitiendo actualizaciones de la Tienda Windows." -ForegroundColor Yellow
         return
     }
 
     if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
-        Write-Host "Actualizando aplicaciones de la Tienda Windows..." -Fore Cyan
+        Write-Host "Actualizando aplicaciones de la Tienda Windows..." -ForegroundColor Cyan
         try {
-            Get-CimInstance -Namespace "Root\cimv2\mdm\dmmap" -ClassName "MDM_EnterpriseModernAppManagement_AppManagement01" |
-            Invoke-CimMethod -MethodName UpdateScanMethod
-            Write-Host "Actualización de aplicaciones de la Tienda Windows completada." -Fore Green
+            $apps = Get-CimInstance -Namespace "Root\cimv2\mdm\dmmap" -ClassName "MDM_EnterpriseModernAppManagement_AppManagement01"
+            if ($apps) {
+                $apps | Invoke-CimMethod -MethodName UpdateScanMethod
+                Write-Host "Actualización de aplicaciones de la Tienda Windows completada." -ForegroundColor Green
+            } else {
+                Write-Host "No se encontraron aplicaciones para actualizar." -ForegroundColor Yellow
+            }
         } catch {
-            Write-Host "Error al actualizar aplicaciones de la Tienda Windows: $_" -Fore Red
+            Write-Host "Error al actualizar aplicaciones de la Tienda Windows: $_" -ForegroundColor Red
         }
     } else {
-        Write-Host "La Tienda Windows no está disponible. Saltando actualizaciones de la Tienda Windows." -Fore Yellow
+        Write-Host "La Tienda Windows no está disponible. Saltando actualizaciones de la Tienda Windows." -ForegroundColor Yellow
     }
 }
 
 # Function to update Chocolatey packages
 function Update-ChocolateyApps {
     if (Get-Command choco -ErrorAction SilentlyContinue) {
-        Write-Host "Actualizando paquetes de Chocolatey..." -Fore Cyan
+        Write-Host "Actualizando paquetes de Chocolatey..." -ForegroundColor Cyan
         try {
+            # Actualizar todos los paquetes de Chocolatey
             choco upgrade all -y
-            Write-Host "Actualización de paquetes de Chocolatey completada." -Fore Green
+            Write-Host "Actualización de paquetes de Chocolatey completada." -ForegroundColor Green
+            
+            # Buscar y actualizar aplicaciones de terceros
+            $thirdPartyApps = choco list --local-only | Select-String "third-party"
+            if ($thirdPartyApps) {
+                Write-Host "Actualizando aplicaciones de terceros..." -ForegroundColor Cyan
+                foreach ($app in $thirdPartyApps) {
+                    choco upgrade $app -y
+                }
+                Write-Host "Actualización de aplicaciones de terceros completada." -ForegroundColor Green
+            } else {
+                Write-Host "No se encontraron aplicaciones de terceros para actualizar." -ForegroundColor Yellow
+            }
         } catch {
-            Write-Host "Error al actualizar paquetes de Chocolatey: $_" -Fore Red
+            Write-Host "Error al actualizar paquetes de Chocolatey: $_" -ForegroundColor Red
         }
     } else {
-        Write-Host "Chocolatey no está instalado. Instalando Chocolatey..." -Fore Yellow
+        Write-Host "Chocolatey no está instalado. Instalando Chocolatey..." -ForegroundColor Yellow
         try {
             Set-ExecutionPolicy Bypass -Scope Process -Force
             [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
             Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-            Write-Host "Chocolatey instalado correctamente." -Fore Green
+            Write-Host "Chocolatey instalado correctamente." -ForegroundColor Green
             Update-ChocolateyApps
         } catch {
-            Write-Host "Error al instalar Chocolatey: $_" -Fore Red
+            Write-Host "Error al instalar Chocolatey: $_" -ForegroundColor Red
         }
     }
 }
 
 # Function to update Winget packages
 function Update-WingetApps {
-    if (Is-Server) {
-        Write-Host "Sistema operativo detectado como servidor. Omitiendo actualizaciones de Winget." -Fore Yellow
-        return
-    }
+    Write-Host "Verificando la disponibilidad de Winget..." -ForegroundColor Cyan
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host "Actualizando paquetes de Winget..." -Fore Cyan
+        Write-Host "Actualizando paquetes de Winget..." -ForegroundColor Cyan
         try {
-            winget upgrade --all
-            Write-Host "Actualización de paquetes de Winget completada." -Fore Green
+            winget upgrade --all --include-unknown --accept-package-agreements --force
+            Write-Host "Actualización de paquetes de Winget completada." -ForegroundColor Green
         } catch {
-            Write-Host "Error al actualizar paquetes de Winget: $_" -Fore Red
+            Write-Host "Error al actualizar paquetes de Winget: $_" -ForegroundColor Red
         }
     } else {
-        Write-Host "Winget no está instalado. Saltando actualizaciones de Winget." -Fore Yellow
+        Write-Host "Winget no está instalado. Instalando Winget..." -ForegroundColor Yellow
+        try {
+            Invoke-WebRequest -Uri "https://aka.ms/getwinget" -OutFile "$env:TEMP\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+            Add-AppxPackage -Path "$env:TEMP\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+            Write-Host "Winget instalado correctamente." -ForegroundColor Green
+            Update-WingetApps
+        } catch {
+            Write-Host "Error al instalar Winget: $_" -ForegroundColor Red
+        }
     }
 }
 
@@ -90,25 +112,36 @@ function Update-RuckZuckApps {
         try {
             $currentVersion = (& $rzPath --version).Split(" ")[-1]
             if ($currentVersion -ne $latestVersion) {
-                Write-Host "RuckZuck no está actualizado. Descargando la última versión..." -Fore Yellow
+                Write-Host "RuckZuck no está actualizado. Descargando la última versión..." -ForegroundColor Yellow
                 Invoke-WebRequest -Uri $rzUrl -OutFile $rzPath
-                Write-Host "RuckZuck actualizado correctamente." -Fore Green
+                Write-Host "RuckZuck actualizado correctamente." -ForegroundColor Green
             }
         } catch {
-            Write-Host "Error al obtener la versión de RuckZuck: $_" -Fore Red
+            Write-Host "Error al obtener la versión de RuckZuck: $_" -ForegroundColor Red
         }
     } else {
-        Write-Host "RuckZuck no está instalado. Instalando RuckZuck..." -Fore Yellow
+        Write-Host "RuckZuck no está instalado. Instalando RuckZuck..." -ForegroundColor Yellow
         Invoke-WebRequest -Uri $rzUrl -OutFile $rzPath
-        Write-Host "RuckZuck descargado correctamente." -Fore Green
+        Write-Host "RuckZuck descargado correctamente." -ForegroundColor Green
     }
 
     try {
-        Write-Host "Actualizando paquetes de RuckZuck..." -Fore Cyan
-        & $rzPath update --all
-        Write-Host "Actualización de paquetes de RuckZuck completada." -Fore Green
+        Write-Host "Actualizando paquetes de RuckZuck..." -ForegroundColor Cyan
+        & $rzPath update --all --retry --user
+        Write-Host "Actualización de paquetes de RuckZuck completada." -ForegroundColor Green
     } catch {
-        Write-Host "Error al actualizar paquetes de RuckZuck: $_" -Fore Red
+        Write-Host "Error al actualizar paquetes de RuckZuck: $_" -ForegroundColor Red
+    }
+
+    try {
+        Write-Host "Instalando paquetes no detectados..." -ForegroundColor Cyan
+        $missingUpdates = & $rzPath update --list --all --user
+        foreach ($update in $missingUpdates) {
+            & $rzPath install --name $update.ProductName --vendor $update.Manufacturer --version $update.ProductVersion
+        }
+        Write-Host "Instalación de paquetes no detectados completada." -ForegroundColor Green
+    } catch {
+        Write-Host "Error al instalar paquetes no detectados: $_" -ForegroundColor Red
     }
 }
 
