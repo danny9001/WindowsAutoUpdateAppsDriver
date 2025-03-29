@@ -15,168 +15,257 @@ function Is-Server {
 }
 
 # Function to update RuckZuck packages
+# Función para actualizar RuckZuck y mostrar detalles de las actualizaciones
 function Update-RuckZuckApps {
-    $rzUrl = "https://github.com/rzander/ruckzuck/releases/download/1.7.3.8/RZGet.exe"
     $rzPath = "$PSScriptRoot\RZGet.exe"
-    $latestVersion = "1.7.3.8"
+    $latestInfo = Get-LatestRZGetVersion
+    if ($null -eq $latestInfo) { return }
 
+    # Verificar si RZGet.exe está instalado y actualizado
     if (Test-Path $rzPath) {
         try {
             $currentVersion = (& $rzPath --version).Split(" ")[-1]
-            if ($currentVersion -ne $latestVersion) {
-                Write-Host "RuckZuck no está actualizado. Descargando la última versión..." -ForegroundColor Yellow
-                Invoke-WebRequest -Uri $rzUrl -OutFile $rzPath
-                Write-Host "RuckZuck actualizado correctamente." -ForegroundColor Green
+            if ($currentVersion -ne $latestInfo.Version) {
+                Write-Host "Nueva versión de RuckZuck disponible. Descargando..." -ForegroundColor Yellow
+                Invoke-WebRequest -Uri $latestInfo.Url -OutFile $rzPath
+                Write-Host "RuckZuck actualizado a la versión $($latestInfo.Version)." -ForegroundColor Green
             }
         } catch {
-            Write-Host "Error al obtener la versión de RuckZuck: $_" -ForegroundColor Red
+            Write-Host "Error al verificar la versión de RuckZuck: $_" -ForegroundColor Red
         }
     } else {
-        Write-Host "RuckZuck no está instalado. Instalando RuckZuck..." -ForegroundColor Yellow
-        Invoke-WebRequest -Uri $rzUrl -OutFile $rzPath
-        Write-Host "RuckZuck descargado correctamente." -ForegroundColor Green
+        Write-Host "RuckZuck no encontrado. Descargando..." -ForegroundColor Yellow
+        Invoke-WebRequest -Uri $latestInfo.Url -OutFile $rzPath
+        Write-Host "RuckZuck instalado correctamente." -ForegroundColor Green
     }
 
+    # Mostrar las aplicaciones que requieren actualización
+    Write-Host "`nVerificando aplicaciones con actualizaciones disponibles..." -ForegroundColor Cyan
     try {
-        Write-Host "Actualizando paquetes de RuckZuck..." -ForegroundColor Cyan
-        & $rzPath update --all --retry --user
-        Write-Host "Actualización de paquetes de RuckZuck completada." -ForegroundColor Green
-    } catch {
-        Write-Host "Error al actualizar paquetes de RuckZuck: $_" -ForegroundColor Red
-    }
-
-    try {
-        Write-Host "Instalando paquetes no detectados..." -ForegroundColor Cyan
-        $missingUpdates = & $rzPath update --list --all --user
-        foreach ($update in $missingUpdates) {
-            & $rzPath install --name $update.ProductName --vendor $update.Manufacturer --version $update.ProductVersion
+        $updatesList = & $rzPath update --list --all --user
+        if ($updatesList -match "No updates available") {
+            Write-Host "No hay actualizaciones pendientes." -ForegroundColor Green
+            return
         }
-        Write-Host "Instalación de paquetes no detectados completada." -ForegroundColor Green
+
+        # Filtrar los nombres de las aplicaciones con actualización disponible
+        $updatesArray = $updatesList -split "`n" | Where-Object { $_ -match "^\s*- " } | ForEach-Object { $_ -replace "^\s*- ", "" }
+
+        if ($updatesArray.Count -gt 0) {
+            Write-Host "`nAplicaciones con actualizaciones disponibles:" -ForegroundColor Yellow
+            $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+
+            # Ejecutar actualización forzada
+            Write-Host "`nForzando actualización de todas las aplicaciones..." -ForegroundColor Cyan
+            & $rzPath update --all --retry --user
+
+            Write-Host "`nActualización completada. Aplicaciones actualizadas:" -ForegroundColor Green
+            $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+        } else {
+            Write-Host "No hay aplicaciones que requieran actualización." -ForegroundColor Green
+        }
     } catch {
-        Write-Host "Error al instalar paquetes no detectados: $_" -ForegroundColor Red
+        Write-Host "Error al verificar o actualizar aplicaciones con RuckZuck: $_" -ForegroundColor Red
+    }
+}
+function Get-LatestRZGetVersion {
+    Write-Host "Buscando la última versión de RZGet..." -ForegroundColor Cyan
+    $repoUrl = "https://api.github.com/repos/rzander/rzget/releases/latest"
+
+    try {
+        $latestInfo = Invoke-RestMethod -Uri $repoUrl -ErrorAction Stop
+        return $latestInfo.tag_name
+    } catch {
+        Write-Host "❌ Error al obtener la última versión de RZGet: $_" -ForegroundColor Red
+        return $null
     }
 }
 
 # Function to update Winget packages
-function Update-WingetApps {
-    Write-Host "Verificando la disponibilidad de Winget..." -ForegroundColor Cyan
+function Update-WinGetApps {
+    Write-Host "`n=== Actualizando aplicaciones con WinGet... ===" -ForegroundColor Cyan
 
-    if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host "Actualizando paquetes de Winget..." -ForegroundColor Cyan
-        try {
-            winget upgrade --all --include-unknown --accept-package-agreements --force
-            Write-Host "Actualización de paquetes de Winget completada." -ForegroundColor Green
-        } catch {
-            Write-Host "Error al actualizar paquetes de Winget: $_" -ForegroundColor Red
+    # Verificar si WinGet está instalado
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host "WinGet no está instalado en este sistema. No se pueden actualizar las aplicaciones." -ForegroundColor Red
+        return
+    }
+
+    # Verificar conexión a Internet
+    Write-Host "Verificando conexión a Internet..." -ForegroundColor Yellow
+    $ping = Test-Connection -ComputerName www.microsoft.com -Count 1 -Quiet
+    if (-not $ping) {
+        Write-Host "Error: No hay conexión a Internet. No se pueden actualizar las aplicaciones." -ForegroundColor Red
+        return
+    }
+
+    # Obtener la lista de aplicaciones que tienen actualizaciones disponibles
+    Write-Host "`nVerificando aplicaciones con actualizaciones disponibles..." -ForegroundColor Yellow
+    try {
+        $updates = winget upgrade --accept-source-agreements | Out-String
+        if ($updates -match "No installed package found matching input criteria") {
+            Write-Host "No hay actualizaciones disponibles para las aplicaciones." -ForegroundColor Green
+            return
         }
-    } else {
-        Write-Host "Winget no está instalado. Instalando Winget..." -ForegroundColor Yellow
-        try {
-            Invoke-WebRequest -Uri "https://aka.ms/getwinget" -OutFile "$env:TEMP\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
-            Add-AppxPackage -Path "$env:TEMP\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
-            Write-Host "Winget instalado correctamente." -ForegroundColor Green
-            Update-WingetApps
-        } catch {
-            Write-Host "Error al instalar Winget: $_" -ForegroundColor Red
+
+        # Extraer los nombres de las aplicaciones con actualización disponible
+        $updatesList = $updates -split "`n" | Where-Object { $_ -match "^\S+" } | ForEach-Object { ($_ -split "\s{2,}")[0] }
+
+        if ($updatesList.Count -gt 0) {
+            Write-Host "`nAplicaciones con actualizaciones disponibles:" -ForegroundColor Yellow
+            $updatesList | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+
+            # Ejecutar la actualización de todas las aplicaciones
+            Write-Host "`nIniciando actualización de aplicaciones con WinGet..." -ForegroundColor Cyan
+            winget upgrade --all --silent --force --accept-package-agreements --accept-source-agreements
+
+            Write-Host "`nActualización completada. Aplicaciones actualizadas:" -ForegroundColor Green
+            $updatesList | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
         }
+    } catch {
+        Write-Host "Error al actualizar aplicaciones con WinGet: $_" -ForegroundColor Red
     }
 }
 
 # Function to update Windows Store apps
-function Update-WindowsStoreApps {
-    if (Is-Server) {
-        Write-Host "Sistema operativo detectado como servidor. Omitiendo actualizaciones de la Tienda Windows." -ForegroundColor Yellow
+function Update-MicrosoftStore {
+    Write-Host "`n=== Actualizando Microsoft Store... ===" -ForegroundColor Cyan
+
+    # Verificar si la Microsoft Store está instalada
+    $storeApp = Get-AppxPackage -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue
+    if (-not $storeApp) {
+        Write-Host "❌ Microsoft Store no está instalada en este sistema." -ForegroundColor Red
         return
     }
 
-    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
-        Write-Host "Actualizando aplicaciones de la Tienda Windows..." -ForegroundColor Cyan
-        try {
-            $apps = Get-CimInstance -Namespace "Root\cimv2\mdm\dmmap" -ClassName "MDM_EnterpriseModernAppManagement_AppManagement01"
-            if ($apps) {
-                $apps | Invoke-CimMethod -MethodName UpdateScanMethod
-                Write-Host "Actualización de aplicaciones de la Tienda Windows completada." -ForegroundColor Green
-            } else {
-                Write-Host "No se encontraron aplicaciones para actualizar." -ForegroundColor Yellow
-            }
-        } catch {
-            Write-Host "Error al actualizar aplicaciones de la Tienda Windows: $_" -ForegroundColor Red
+    # Verificar conexión a Internet
+    Write-Host "🔍 Verificando conexión a Internet..." -ForegroundColor Yellow
+    $ping = Test-Connection -ComputerName www.microsoft.com -Count 1 -Quiet
+    if (-not $ping) {
+        Write-Host "❌ No hay conexión a Internet. No se puede actualizar la Microsoft Store." -ForegroundColor Red
+        return
+    }
+
+    try {
+        # Reiniciar servicios necesarios
+        Write-Host "🔄 Reiniciando servicios necesarios para la actualización..." -ForegroundColor Yellow
+        Stop-Service -Name wuauserv, cryptsvc -Force -ErrorAction SilentlyContinue
+        Start-Service -Name wuauserv, cryptsvc -PassThru | ForEach-Object {
+            Write-Host "✅ Servicio $($_.Name) iniciado correctamente."
         }
-    } else {
-        Write-Host "La Tienda Windows no está disponible. Saltando actualizaciones de la Tienda Windows." -ForegroundColor Yellow
+
+        # Verificar si wsreset.exe existe antes de ejecutarlo
+        $wsresetPath = "C:\Windows\System32\wsreset.exe"
+        if (Test-Path $wsresetPath) {
+            Write-Host "🔄 Ejecutando limpieza de caché de la Microsoft Store..." -ForegroundColor Yellow
+            Start-Process -NoNewWindow -FilePath $wsresetPath -Wait
+        } else {
+            Write-Host "⚠️ wsreset.exe no encontrado. Saltando limpieza de caché." -ForegroundColor Yellow
+        }
+
+        # Actualizar todas las aplicaciones de la Microsoft Store
+        Write-Host "🔄 Forzando actualización de todas las aplicaciones de la Microsoft Store..." -ForegroundColor Yellow
+        Start-Process -NoNewWindow -FilePath "winget" -ArgumentList "upgrade --all --accept-package-agreements --accept-source-agreements" -Wait
+
+        Write-Host "✅ Actualización de la Microsoft Store completada." -ForegroundColor Green
+    }
+    catch {
+        Write-Host "❌ Error al actualizar la Microsoft Store: $_" -ForegroundColor Red
+    }
+
+    # Opción de reparación si la tienda está dañada
+    if (-not (Get-AppxPackage -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue)) {
+        Write-Host "⚠️ La Microsoft Store parece estar dañada. Intentando reinstalar..." -ForegroundColor Yellow
+        try {
+            Get-AppxPackage -allusers Microsoft.WindowsStore | ForEach-Object {
+                Add-AppxPackage -DisableDevelopmentMode -Register "$($_.InstallLocation)\AppXManifest.xml"
+            }
+            Write-Host "✅ Microsoft Store reinstalada correctamente." -ForegroundColor Green
+        } catch {
+            Write-Host "❌ Error al reinstalar la Microsoft Store: $_" -ForegroundColor Red
+        }
     }
 }
 
-# Function to update drivers from Windows Update
-function Update-Drivers {
-    Write-Host "Se conectó a Windows Update en busca de drivers y actualizaciones..." -ForegroundColor Cyan
-    $UpdateSearcher = New-Object -Com Microsoft.Update.Searcher
-    Write-Host "Se inició la búsqueda de drivers y actualizaciones..." -ForegroundColor Cyan
-    $SearchResult = $UpdateSearcher.Search("IsInstalled=0")
+# Función para actualizar drivers y actualizaciones de Windows
+function Update-WindowsDriversAndUpdates {
+    Write-Host "`n=== Iniciando actualización de drivers y actualizaciones de Windows... ===" -ForegroundColor Cyan
 
-    # Inicializar la barra de progreso
-    $progress = 0
-    $totalUpdates = $SearchResult.Updates.Count
-    $UpdatesToDownload = New-Object -Com Microsoft.Update.UpdateColl
-
-    foreach ($Update in $SearchResult.Updates) {
-        $UpdatesToDownload.Add($Update) | Out-Null
-        Write-Host "Encontrado controlador o Actualizacion: $($Update.Title)" -ForegroundColor Cyan
-        $progress++
-        Write-Progress -Activity "Buscando drivers" -Status "$progress de $totalUpdates encontrados" -PercentComplete (($progress / $totalUpdates) * 100)
-    }
-
-    # Verificación de que la variable $UpdatesToDownload no esté vacía
-    if ($UpdatesToDownload.Count -eq 0) {
-        Write-Host "No hay actualizaciones disponibles para descargar." -ForegroundColor Yellow
+    # Verificar conexión a Internet
+    Write-Host "🔍 Verificando conexión a Internet..." -ForegroundColor Yellow
+    if (-not (Test-Connection -ComputerName 8.8.8.8 -Count 2 -Quiet)) {
+        Write-Host "❌ No hay conexión a Internet. Abortando actualización..." -ForegroundColor Red
         return
     }
 
-    try {
-        Write-Host "Iniciando sesión de actualización..." -ForegroundColor Cyan
-        $UpdateSession = New-Object -Com Microsoft.Update.Session
-        $Downloader = $UpdateSession.CreateUpdateDownloader()
-        $Downloader.Updates = $UpdatesToDownload
-        if (-not $Downloader.Updates) {
-            throw "No hay actualizaciones para descargar."
+    # Reiniciar servicios de Windows Update
+    Write-Host "🔄 Reiniciando servicios de Windows Update..." -ForegroundColor Yellow
+    $services = @("wuauserv", "cryptsvc")
+    Try {
+        $services | ForEach-Object {
+            Stop-Service -Name $_ -Force -ErrorAction SilentlyContinue
+            Start-Service -Name $_ -ErrorAction Stop
+            Write-Host "✅ Servicio $_ reiniciado correctamente." -ForegroundColor Green
         }
-        Write-Host "Descargando actualizaciones..." -ForegroundColor Cyan
-        $Downloader.Download()
-        Write-Host "Descarga completada." -ForegroundColor Green
-    } catch {
-        Write-Host "Error al descargar las actualizaciones: $_" -ForegroundColor Red
-        return
+    } Catch {
+        Write-Host "⚠️ No se pudieron reiniciar algunos servicios: $_" -ForegroundColor Yellow
     }
 
-    # Verificar si los controladores están descargados y desencadenar la instalación
-    try {
-        $UpdatesToInstall = New-Object -Com Microsoft.Update.UpdateColl
-        $UpdatesToDownload | ForEach-Object {
-            if ($_.IsDownloaded) {
-                $UpdatesToInstall.Add($_) | Out-Null
-                Write-Host "Instalando controlador: $($_.Title)" -ForegroundColor Cyan
-            }
+    # Instalar o importar PSWindowsUpdate
+    if (!(Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+        Write-Host "📥 Instalando módulo PSWindowsUpdate..." -ForegroundColor Yellow
+        Try {
+            Install-Module PSWindowsUpdate -Force -Scope CurrentUser -AllowClobber
+            Import-Module PSWindowsUpdate
+        } Catch {
+            Write-Host "❌ Error al instalar PSWindowsUpdate: $_" -ForegroundColor Red
+            return
         }
-        if ($UpdatesToInstall.Count -eq 0) {
-            throw "No hay actualizaciones descargadas para instalar."
-        }
-        Write-Host 'Instalando controladores o actualizacion...' -ForegroundColor Green
-        $Installer = $UpdateSession.CreateUpdateInstaller()
-        $Installer.Updates = $UpdatesToInstall
-        $InstallationResult = $Installer.Install()
-        if ($InstallationResult.RebootRequired) {
-            Write-Host '¡Reinicio requerido! Por favor, reinicie ahora.' -ForegroundColor Red
-        } else {
-            Write-Host 'Instalación completada.' -ForegroundColor Green
-        }
-    } catch {
-        Write-Host "Error durante la instalación: $_" -ForegroundColor Red
+    } else {
+        Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
     }
+
+    # Buscar e instalar actualizaciones
+    Write-Host "🔍 Buscando actualizaciones de Windows y drivers..." -ForegroundColor Yellow
+    try {
+        Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot | Out-Null
+        Write-Host "✅ Actualizaciones instaladas correctamente." -ForegroundColor Green
+    } catch {
+        Write-Host "❌ Error durante la actualización de Windows y drivers: $_" -ForegroundColor Red
+    }
+
+    # Verificar si es necesario reiniciar
+    if (Get-PendingReboot) {
+        Write-Host "⚠️ Se requiere reiniciar el sistema para aplicar cambios." -ForegroundColor Yellow
+    } else {
+        Write-Host "✅ No es necesario reiniciar el sistema." -ForegroundColor Green
+    }
+}
+
+# Función para verificar si se requiere reinicio del sistema
+function Get-PendingReboot {
+    Write-Host "🔄 Verificando si es necesario reiniciar el equipo..." -ForegroundColor Yellow
+
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
+    )
+
+    foreach ($key in $keys) {
+        if (Test-Path $key) {
+            Write-Host "⚠️ Se requiere reiniciar el sistema para aplicar cambios." -ForegroundColor Yellow
+            return $true
+        }
+    }
+
+    Write-Host "✅ No es necesario reiniciar el sistema." -ForegroundColor Green
+    return $false
 }
 
 # Main execution
 Write-Host "Iniciando actualizaciones automáticas de aplicaciones y drivers..." -ForegroundColor Cyan
 Update-RuckZuckApps
 Update-WingetApps
-Update-WindowsStoreApps
-Update-Drivers
+Update-MicrosoftStore
+Update-WindowsDriversAndUpdates
