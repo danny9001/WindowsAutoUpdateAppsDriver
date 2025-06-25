@@ -16,60 +16,54 @@ function Is-Server {
 
 # Function to update RuckZuck packages
 # Función para actualizar RuckZuck y mostrar detalles de las actualizaciones
+
 function Update-RuckZuckApps {
     $rzPath = "$PSScriptRoot\RZGet.exe"
-    $latestInfo = Get-LatestRZGetVersion
-    if ($null -eq $latestInfo) { return }
+    $rzVersion = "1.7.3.8"
+    $rzDownloadUrl = "https://github.com/rzander/ruckzuck/releases/download/$rzVersion/RZGet.exe"
 
-    # Verificar si RZGet.exe está instalado y actualizado
-    if (Test-Path $rzPath) {
+    # Verificar si RZGet.exe existe
+    if (!(Test-Path $rzPath)) {
+        Write-Host "📥 RZGet.exe no encontrado. Descargando versión $rzVersion..." -ForegroundColor Yellow
         try {
-            $currentVersion = (& $rzPath --version).Split(" ")[-1]
-            if ($currentVersion -ne $latestInfo.Version) {
-                Write-Host "Nueva versión de RuckZuck disponible. Descargando..." -ForegroundColor Yellow
-                Invoke-WebRequest -Uri $latestInfo.Url -OutFile $rzPath
-                Write-Host "RuckZuck actualizado a la versión $($latestInfo.Version)." -ForegroundColor Green
-            }
+            Invoke-WebRequest -Uri $rzDownloadUrl -OutFile $rzPath -UseBasicParsing
+            Write-Host "✅ RZGet.exe descargado correctamente." -ForegroundColor Green
         } catch {
-            Write-Host "Error al verificar la versión de RuckZuck: $_" -ForegroundColor Red
+            Write-Host "❌ Error al descargar RZGet.exe: $_" -ForegroundColor Red
+            return
         }
-    } else {
-        Write-Host "RuckZuck no encontrado. Descargando..." -ForegroundColor Yellow
-        Invoke-WebRequest -Uri $latestInfo.Url -OutFile $rzPath
-        Write-Host "RuckZuck instalado correctamente." -ForegroundColor Green
     }
 
-    # Mostrar las aplicaciones que requieren actualización
-    Write-Host "`nVerificando aplicaciones con actualizaciones disponibles..." -ForegroundColor Cyan
+    # Buscar actualizaciones disponibles
+    Write-Host "`n🔍 Verificando aplicaciones con actualizaciones disponibles mediante RZGet..." -ForegroundColor Cyan
     try {
         $updatesList = & $rzPath update --list --all --user
         if ($updatesList -match "No updates available") {
-            Write-Host "No hay actualizaciones pendientes." -ForegroundColor Green
+            Write-Host "✅ No hay actualizaciones pendientes." -ForegroundColor Green
             return
         }
 
-        # Filtrar los nombres de las aplicaciones con actualización disponible
-        $updatesArray = $updatesList -split "`n" | Where-Object { $_ -match "^\s*- " } | ForEach-Object { $_ -replace "^\s*- ", "" }
+        $updatesArray = $updatesList -split "`n" |
+            Where-Object { $_ -match "^\s*\- " } |
+            ForEach-Object { $_ -replace "^\s*\- ", "" }
 
         if ($updatesArray.Count -gt 0) {
-            Write-Host "`nAplicaciones con actualizaciones disponibles:" -ForegroundColor Yellow
+            Write-Host "`n✨ Aplicaciones con actualizaciones disponibles:" -ForegroundColor Yellow
             $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
 
-            # Ejecutar actualización forzada
-            Write-Host "`nForzando actualización de todas las aplicaciones..." -ForegroundColor Cyan
+            Write-Host "`n🔄 Iniciando actualización de todas las aplicaciones con RZGet..." -ForegroundColor Cyan
             & $rzPath update --all --retry --user
 
-            Write-Host "`nActualización completada. Aplicaciones actualizadas:" -ForegroundColor Green
+            Write-Host "`n✅ Actualización completada. Aplicaciones actualizadas:" -ForegroundColor Green
             $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
-        } else {
-            Write-Host "No hay aplicaciones que requieran actualización." -ForegroundColor Green
         }
     } catch {
-        Write-Host "Error al verificar o actualizar aplicaciones con RuckZuck: $_" -ForegroundColor Red
+        Write-Host "❌ Error al verificar o actualizar aplicaciones con RZGet: $_" -ForegroundColor Red
     }
 }
+
 function Get-LatestRZGetVersion {
-    Write-Host "Buscando la última versión de RZGet..." -ForegroundColor Cyan
+    Write-Host "🔍 Buscando la última versión de RZGet..." -ForegroundColor Cyan
     $repoUrl = "https://api.github.com/repos/rzander/rzget/releases/latest"
 
     try {
@@ -80,6 +74,8 @@ function Get-LatestRZGetVersion {
         return $null
     }
 }
+
+
 
 # Function to update Winget packages
 function Update-WinGetApps {
