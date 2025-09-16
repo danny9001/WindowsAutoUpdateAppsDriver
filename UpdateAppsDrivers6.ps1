@@ -1,267 +1,426 @@
-# Actualizacion de Aplicaciones automatica y Drivers desde Windows Update
-# Autor: Daniel Landivar
-# Licencia: CC BY-NC (Reconocimiento-NoComercial)
+#requires -Version 5.1
+<#
+.SYNOPSIS
+  Actualiza apps (RuckZuck, WinGet, Microsoft Store) y Windows/Drivers.
+  Compatible con Windows PowerShell 5.1 y PowerShell 7+. Preferible PS 7+.
 
-# Créditos:
-# Editor: Microsoft Copilot
-# RuckZuck: https://github.com/rzander/ruckzuck, https://ruckzuck.tools/
-# Winget: https://github.com/microsoft/winget-cli
-# Windows Update: Microsoft
+.NOTES
+  - Si se ejecuta en PS < 7, intentará relanzar en pwsh.exe (configurable).
+  - En Windows Server se omiten tareas de Microsoft Store.
+#>
 
-# Function to check if the system is a server
-function Is-Server {
-    $os = Get-WmiObject Win32_OperatingSystem
-    return $os.ProductType -ne 1
+[CmdletBinding()]
+param(
+    [switch]$NoRelaunch
+)
+
+# -------------------------
+# Utilidades base
+# -------------------------
+function Write-Info($msg)    { Write-Host $msg -ForegroundColor Cyan }
+function Write-Ok($msg)      { Write-Host $msg -ForegroundColor Green }
+function Write-WarnMsg($msg) { Write-Host $msg -ForegroundColor Yellow }
+function Write-ErrMsg($msg)  { Write-Host $msg -ForegroundColor Red }
+
+# Forzar TLS 1.2 en Windows PowerShell 5.1
+function Set-Tls12Enable {
+    try {
+        if ($PSVersionTable.PSVersion.Major -lt 7) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        }
+    } catch { }
 }
 
-# Function to update RuckZuck packages
-# Función para actualizar RuckZuck y mostrar detalles de las actualizaciones
+# Chequeo de admin (algunas tareas lo requieren)
+function Test-IsAdmin {
+    $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $wp = New-Object Security.Principal.WindowsPrincipal($wi)
+    return $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
-function Update-RuckZuckApps {
-    $rzPath = "$PSScriptRoot\RZGet.exe"
-    $rzVersion = "1.7.3.8"
-    $rzDownloadUrl = "https://github.com/rzander/ruckzuck/releases/download/$rzVersion/RZGet.exe"
+# Internet robusto: pruebas HTTP/HTTPS (con proxy por defecto) + fallback TCP 443
+function Test-Internet {
+    param(
+        [int]$TimeoutMs = 5000,
+        [switch]$VerboseMode
+    )
 
-    # Verificar si RZGet.exe existe
-    if (!(Test-Path $rzPath)) {
-        Write-Host "📥 RZGet.exe no encontrado. Descargando versión $rzVersion..." -ForegroundColor Yellow
+    Set-Tls12Enable
+
+    # Intentar usar proxy del sistema con credenciales por defecto (útil en dominios)
+    try {
+        [System.Net.WebRequest]::DefaultWebProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        [System.Net.WebRequest]::DefaultWebProxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+    } catch {}
+
+    $probes = @(
+        # NCSI / ConnectTest: pueden estar bloqueados en redes corporativas, probamos igual
+        @{ Uri='http://www.msftconnecttest.com/connecttest.txt'; Expect='Microsoft Connect Test'; Method='GET'  },
+        @{ Uri='http://www.msftncsi.com/ncsi.txt';             Expect='Microsoft NCSI';        Method='GET'  },
+        # HTTPS HEAD a dominios de Microsoft (aceptamos 2xx/3xx)
+        @{ Uri='https://www.microsoft.com';                     Expect=$null;                  Method='HEAD' },
+        @{ Uri='https://www.bing.com';                          Expect=$null;                  Method='HEAD' }
+    )
+
+    foreach ($p in $probes) {
         try {
-            Invoke-WebRequest -Uri $rzDownloadUrl -OutFile $rzPath -UseBasicParsing
-            Write-Host "✅ RZGet.exe descargado correctamente." -ForegroundColor Green
+            $params = @{
+                Uri         = $p.Uri
+                Method      = $p.Method
+                TimeoutSec  = [math]::Ceiling($TimeoutMs/1000.0)
+                ErrorAction = 'Stop'
+            }
+            if ($PSVersionTable.PSVersion.Major -lt 7) { $params.UseBasicParsing = $true }
+            $resp = Invoke-WebRequest @params
+            if ($p.Expect) {
+                if ($resp.Content -match [regex]::Escape($p.Expect)) { return $true }
+            } else {
+                if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) { return $true }
+            }
         } catch {
-            Write-Host "❌ Error al descargar RZGet.exe: $_" -ForegroundColor Red
-            return
+            if ($VerboseMode) {
+                Write-Host ("[Test-Internet] Falló {0}: {1}" -f $p.Uri, $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+            continue
         }
     }
 
-    # Buscar actualizaciones disponibles
-    Write-Host "`n🔍 Verificando aplicaciones con actualizaciones disponibles mediante RZGet..." -ForegroundColor Cyan
+    # Último recurso: prueba TCP 443 (no HTTP)
     try {
-        $updatesList = & $rzPath update --list --all --user
-        if ($updatesList -match "No updates available") {
-            Write-Host "✅ No hay actualizaciones pendientes." -ForegroundColor Green
-            return
-        }
-
-        $updatesArray = $updatesList -split "`n" |
-            Where-Object { $_ -match "^\s*\- " } |
-            ForEach-Object { $_ -replace "^\s*\- ", "" }
-
-        if ($updatesArray.Count -gt 0) {
-            Write-Host "`n✨ Aplicaciones con actualizaciones disponibles:" -ForegroundColor Yellow
-            $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
-
-            Write-Host "`n🔄 Iniciando actualización de todas las aplicaciones con RZGet..." -ForegroundColor Cyan
-            & $rzPath update --all --retry --user
-
-            Write-Host "`n✅ Actualización completada. Aplicaciones actualizadas:" -ForegroundColor Green
-            $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect('www.microsoft.com', 443, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            $client.EndConnect($iar); $client.Close()
+            return $true
+        } else {
+            $client.Close()
         }
     } catch {
-        Write-Host "❌ Error al verificar o actualizar aplicaciones con RZGet: $_" -ForegroundColor Red
+        if ($VerboseMode) {
+            Write-Host ("[Test-Internet] Falló TCP 443: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow
+        }
+    }
+
+    return $false
+}
+
+# Detectar/Relanzar en PowerShell 7 si estamos en 5.1 (por defecto relanza)
+function Ensure-PowerShell7 {
+    param([switch]$NoRelaunch)
+    if ($PSVersionTable.PSVersion.Major -ge 7) { return $true }
+
+    Write-WarnMsg "⚠️ Detectado Windows PowerShell $($PSVersionTable.PSVersion). Se recomienda PowerShell 7 o superior."
+    if ($NoRelaunch) { return $false }
+
+    # Buscar pwsh.exe
+    $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    if (-not $pwshCmd) {
+        $candidate = Join-Path $Env:ProgramFiles 'PowerShell\7\pwsh.exe'
+        if (Test-Path $candidate) { $pwshCmd = $candidate }
+    }
+    if ($pwshCmd) {
+        Write-Info "🔁 Reejecutando este script en PowerShell 7..."
+        $argsToPass = @()
+        if ($PSBoundParameters.ContainsKey('NoRelaunch') -and $NoRelaunch) {
+            $argsToPass += '-NoRelaunch'
+        }
+        if ($PSCommandPath) {
+            Start-Process -FilePath $pwshCmd -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $argsToPass -Wait
+        } else {
+            Start-Process -FilePath $pwshCmd -ArgumentList @('-NoLogo','-NoProfile') -Wait
+        }
+        exit
+    } else {
+        Write-WarnMsg "⚠️ No se encontró pwsh.exe. Continuando en Windows PowerShell con compatibilidad."
+        return $false
     }
 }
+
+# Detectar si es Server (ProductType 1=Workstation, 2=DC, 3=Server)
+function Get-IsServer {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem
+        return ($os.ProductType -ne 1)
+    } catch {
+        # Fallback si CIM no está disponible por alguna razón
+        try {
+            $os = Get-WmiObject Win32_OperatingSystem
+            return ($os.ProductType -ne 1)
+        } catch { return $false }
+    }
+}
+
+# -------------------------
+# RuckZuck (RZGet)
+# -------------------------
+# Descarga última versión estable sin tener que conocer la tag
+$Global:RZGetDownloadUrlLatest = 'https://github.com/rzander/ruckzuck/releases/latest/download/RZGet.exe'
 
 function Get-LatestRZGetVersion {
-    Write-Host "🔍 Buscando la última versión de RZGet..." -ForegroundColor Cyan
-    $repoUrl = "https://api.github.com/repos/rzander/rzget/releases/latest"
-
+    Set-Tls12Enable
     try {
-        $latestInfo = Invoke-RestMethod -Uri $repoUrl -ErrorAction Stop
-        return $latestInfo.tag_name
+        $headers = @{
+            'User-Agent' = 'RuckZuck-Updater'
+            'Accept'     = 'application/vnd.github+json'
+        }
+        $api = 'https://api.github.com/repos/rzander/ruckzuck/releases/latest'
+        $latest = Invoke-RestMethod -Uri $api -Headers $headers -ErrorAction Stop
+        return $latest.tag_name
     } catch {
-        Write-Host "❌ Error al obtener la última versión de RZGet: $_" -ForegroundColor Red
         return $null
     }
 }
 
-
-
-# Function to update Winget packages
-function Update-WinGetApps {
-    Write-Host "`n=== Actualizando aplicaciones con WinGet... ===" -ForegroundColor Cyan
-
-    # Verificar si WinGet está instalado
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Host "WinGet no está instalado en este sistema. No se pueden actualizar las aplicaciones." -ForegroundColor Red
-        return
-    }
-
-    # Verificar conexión a Internet
-    Write-Host "Verificando conexión a Internet..." -ForegroundColor Yellow
-    $ping = Test-Connection -ComputerName www.microsoft.com -Count 1 -Quiet
-    if (-not $ping) {
-        Write-Host "Error: No hay conexión a Internet. No se pueden actualizar las aplicaciones." -ForegroundColor Red
-        return
-    }
-
-    # Obtener la lista de aplicaciones que tienen actualizaciones disponibles
-    Write-Host "`nVerificando aplicaciones con actualizaciones disponibles..." -ForegroundColor Yellow
-    try {
-        $updates = winget upgrade --accept-source-agreements | Out-String
-        if ($updates -match "No installed package found matching input criteria") {
-            Write-Host "No hay actualizaciones disponibles para las aplicaciones." -ForegroundColor Green
+function Update-RuckZuckApps {
+    $rzPath = Join-Path $PSScriptRoot 'RZGet.exe'
+    if (!(Test-Path $rzPath)) {
+        Write-WarnMsg "📥 RZGet.exe no encontrado. Descargando la última versión..."
+        if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg "❌ Sin Internet. No puedo descargar RZGet."; return }
+        Set-Tls12Enable
+        try {
+            $iwrParams = @{ Uri = $Global:RZGetDownloadUrlLatest; OutFile = $rzPath; ErrorAction='Stop' }
+            if ($PSVersionTable.PSVersion.Major -lt 7) { $iwrParams.UseBasicParsing = $true }
+            Invoke-WebRequest @iwrParams
+            Write-Ok "✅ RZGet.exe descargado."
+        } catch {
+            Write-ErrMsg "❌ Error al descargar RZGet: $($_.Exception.Message)"
             return
         }
+    }
 
-        # Extraer los nombres de las aplicaciones con actualización disponible
-        $updatesList = $updates -split "`n" | Where-Object { $_ -match "^\S+" } | ForEach-Object { ($_ -split "\s{2,}")[0] }
+    Write-Info "🔍 Verificando aplicaciones con actualizaciones disponibles mediante RZGet..."
+    try {
+        $updatesList = & $rzPath update --list --all --user 2>&1
+        if ($updatesList -match 'No updates available') {
+            Write-Ok "✅ No hay actualizaciones pendientes por RZGet."
+            return
+        }
+        $updatesArray = $updatesList -split "`n" | Where-Object { $_ -match "^\s*\- " } | ForEach-Object { $_ -replace "^\s*\- ", "" }
+        if ($updatesArray.Count -gt 0) {
+            Write-WarnMsg "✨ Actualizaciones disponibles (RZGet):"
+            $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
 
-        if ($updatesList.Count -gt 0) {
-            Write-Host "`nAplicaciones con actualizaciones disponibles:" -ForegroundColor Yellow
-            $updatesList | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+            Write-Info "🔄 Iniciando actualización con RZGet..."
+            & $rzPath update --all --retry --user
 
-            # Ejecutar la actualización de todas las aplicaciones
-            Write-Host "`nIniciando actualización de aplicaciones con WinGet..." -ForegroundColor Cyan
-            winget upgrade --all --silent --force --accept-package-agreements --accept-source-agreements
-
-            Write-Host "`nActualización completada. Aplicaciones actualizadas:" -ForegroundColor Green
-            $updatesList | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+            Write-Ok "✅ Actualización RZGet completada. Aplicaciones actualizadas:"
+            $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
+        } else {
+            Write-Ok "✅ No se detectaron entradas parseables; puede que no haya actualizaciones."
         }
     } catch {
-        Write-Host "Error al actualizar aplicaciones con WinGet: $_" -ForegroundColor Red
+        Write-ErrMsg "❌ Error al verificar/actualizar con RZGet: $($_.Exception.Message)"
     }
 }
 
-# Function to update Windows Store apps
-function Update-MicrosoftStore {
-    Write-Host "`n=== Actualizando Microsoft Store... ===" -ForegroundColor Cyan
+# -------------------------
+# WinGet
+# -------------------------
+function Ensure-WinGetSources {
+    try {
+        Write-Info "🔄 Actualizando/Restableciendo fuentes de WinGet..."
+        winget source update --disable-interactivity | Out-Null
+        # Restablece fuentes por defecto (winget + msstore)
+        winget source reset --disable-interactivity | Out-Null
+    } catch {
+        Write-WarnMsg "⚠️ No se pudieron actualizar/restablecer las fuentes de WinGet: $($_.Exception.Message)"
+    }
+}
 
-    # Verificar si la Microsoft Store está instalada
+function Get-WinGetUpgradesList {
+    param([switch]$AsTextFallback)
+
+    try {
+        $json = winget upgrade --accept-source-agreements --include-unknown --output json --disable-interactivity 2>$null
+        if ([string]::IsNullOrWhiteSpace($json)) { throw "Salida JSON vacía" }
+        $data = $json | ConvertFrom-Json -ErrorAction Stop
+        # Winget puede devolver 'Upgrades' o lista plana
+        if ($data.PSObject.Properties.Name -contains 'Upgrades') {
+            return $data.Upgrades
+        } elseif ($data -is [System.Collections.IEnumerable]) {
+            return $data
+        } else {
+            return @()
+        }
+    } catch {
+        if ($AsTextFallback) {
+            $text = winget upgrade --accept-source-agreements --include-unknown --disable-interactivity | Out-String
+            $lines = $text -split "`n" | Where-Object { $_ -match '^\S' }
+            return $lines
+        } else { throw }
+    }
+}
+
+function Update-WinGetApps {
+    Write-Info "=== Actualizando aplicaciones con WinGet... ==="
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-ErrMsg "❌ WinGet no está instalado. Omitiendo."
+        return
+    }
+    # Permitir que winget pruebe conectividad si las sondas HTTP fallan
+    $internet = Test-Internet -VerboseMode
+    if (-not $internet) {
+        Write-WarnMsg "⚠️ Sondas HTTP fallaron; probando comando 'winget source list' como verificación directa..."
+        try { winget source list --disable-interactivity | Out-Null; $internet = $true } catch { }
+    }
+    if (-not $internet) {
+        Write-ErrMsg "❌ Sin Internet. Omitiendo WinGet."
+        return
+    }
+
+    Ensure-WinGetSources
+
+    try {
+        $upgrades = Get-WinGetUpgradesList -AsTextFallback
+        if (-not $upgrades -or $upgrades.Count -eq 0) {
+            Write-Ok "✅ No hay actualizaciones WinGet disponibles."
+            return
+        }
+
+        Write-WarnMsg "✨ Aplicaciones con actualización (WinGet):"
+        if ($upgrades -is [System.Collections.IEnumerable] -and $upgrades -and $upgrades[0].PSObject.Properties.Name -contains 'Package' ) {
+            $upgrades | ForEach-Object { Write-Host (" - " + ($_?.Package?.Name ?? $_?.PackageIdentifier)) -ForegroundColor White }
+        } else {
+            $upgrades | ForEach-Object { Write-Host (" - " + $_) -ForegroundColor White }
+        }
+
+        Write-Info "🔄 Ejecutando 'winget upgrade --all' (incluye pinned y versiones desconocidas)..."
+        winget upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+
+        Write-Ok "✅ Actualización WinGet completada."
+    } catch {
+        Write-ErrMsg "❌ Error en actualización con WinGet: $($_.Exception.Message)"
+    }
+}
+
+# -------------------------
+# Microsoft Store
+# -------------------------
+function Update-MicrosoftStore {
+    Write-Info "=== Actualizando apps de Microsoft Store... ==="
+
+    if (Get-IsServer) {
+        Write-WarnMsg "ℹ️ Equipo tipo Server: se omite Microsoft Store."
+        return
+    }
+
     $storeApp = Get-AppxPackage -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue
     if (-not $storeApp) {
-        Write-Host "❌ Microsoft Store no está instalada en este sistema." -ForegroundColor Red
+        Write-ErrMsg "❌ Microsoft Store no está instalada en este sistema."
         return
     }
-
-    # Verificar conexión a Internet
-    Write-Host "🔍 Verificando conexión a Internet..." -ForegroundColor Yellow
-    $ping = Test-Connection -ComputerName www.microsoft.com -Count 1 -Quiet
-    if (-not $ping) {
-        Write-Host "❌ No hay conexión a Internet. No se puede actualizar la Microsoft Store." -ForegroundColor Red
+    if (-not (Test-Internet -VerboseMode)) {
+        Write-ErrMsg "❌ Sin Internet. Omitiendo Store."
         return
     }
 
     try {
-        # Reiniciar servicios necesarios
-        Write-Host "🔄 Reiniciando servicios necesarios para la actualización..." -ForegroundColor Yellow
-        Stop-Service -Name wuauserv, cryptsvc -Force -ErrorAction SilentlyContinue
-        Start-Service -Name wuauserv, cryptsvc -PassThru | ForEach-Object {
-            Write-Host "✅ Servicio $($_.Name) iniciado correctamente."
-        }
-
-        # Verificar si wsreset.exe existe antes de ejecutarlo
+        # Limpieza de caché con wsreset
         $wsresetPath = "C:\Windows\System32\wsreset.exe"
         if (Test-Path $wsresetPath) {
-            Write-Host "🔄 Ejecutando limpieza de caché de la Microsoft Store..." -ForegroundColor Yellow
-            Start-Process -NoNewWindow -FilePath $wsresetPath -Wait
+            Write-WarnMsg "🔄 Limpiando caché de Microsoft Store (wsreset)..."
+            Start-Process -FilePath $wsresetPath -NoNewWindow -Wait
         } else {
-            Write-Host "⚠️ wsreset.exe no encontrado. Saltando limpieza de caché." -ForegroundColor Yellow
+            Write-WarnMsg "⚠️ wsreset.exe no encontrado; continúo sin limpieza."
         }
 
-        # Actualizar todas las aplicaciones de la Microsoft Store
-        Write-Host "🔄 Forzando actualización de todas las aplicaciones de la Microsoft Store..." -ForegroundColor Yellow
-        Start-Process -NoNewWindow -FilePath "winget" -ArgumentList "upgrade --all --accept-package-agreements --accept-source-agreements" -Wait
-
-        Write-Host "✅ Actualización de la Microsoft Store completada." -ForegroundColor Green
-    }
-    catch {
-        Write-Host "❌ Error al actualizar la Microsoft Store: $_" -ForegroundColor Red
-    }
-
-    # Opción de reparación si la tienda está dañada
-    if (-not (Get-AppxPackage -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue)) {
-        Write-Host "⚠️ La Microsoft Store parece estar dañada. Intentando reinstalar..." -ForegroundColor Yellow
-        try {
-            Get-AppxPackage -allusers Microsoft.WindowsStore | ForEach-Object {
-                Add-AppxPackage -DisableDevelopmentMode -Register "$($_.InstallLocation)\AppXManifest.xml"
-            }
-            Write-Host "✅ Microsoft Store reinstalada correctamente." -ForegroundColor Green
-        } catch {
-            Write-Host "❌ Error al reinstalar la Microsoft Store: $_" -ForegroundColor Red
+        # Asegurar fuente msstore en WinGet y actualizar
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            Ensure-WinGetSources
+            Write-Info "🔄 Actualizando apps Store vía WinGet (fuente msstore)..."
+            winget upgrade --source msstore --all --include-unknown --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+        } else {
+            Write-WarnMsg "⚠️ WinGet no está presente; solo se ejecutó wsreset."
         }
+
+        Write-Ok "✅ Proceso de Microsoft Store finalizado."
+    } catch {
+        Write-ErrMsg "❌ Error en Microsoft Store: $($_.Exception.Message)"
     }
 }
 
-# Función para actualizar drivers y actualizaciones de Windows
-function Update-WindowsDriversAndUpdates {
-    Write-Host "`n=== Iniciando actualización de drivers y actualizaciones de Windows... ===" -ForegroundColor Cyan
+# -------------------------
+# Windows Update (drivers + parches)
+# -------------------------
+function Ensure-NuGetProvider {
+    try {
+        if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
+            Write-Info "📥 Instalando proveedor NuGet para PowerShellGet..."
+            Install-PackageProvider -Name NuGet -Scope CurrentUser -Force -ErrorAction Stop | Out-Null
+        }
+    } catch {
+        Write-WarnMsg "⚠️ No se pudo instalar el proveedor NuGet: $($_.Exception.Message)"
+    }
+}
 
-    # Verificar conexión a Internet
-    Write-Host "🔍 Verificando conexión a Internet..." -ForegroundColor Yellow
-    if (-not (Test-Connection -ComputerName 8.8.8.8 -Count 2 -Quiet)) {
-        Write-Host "❌ No hay conexión a Internet. Abortando actualización..." -ForegroundColor Red
+function Update-WindowsDriversAndUpdates {
+    Write-Info "=== Iniciando Windows Update (sistema y drivers)... ==="
+
+    if (-not (Test-Internet -VerboseMode)) {
+        Write-ErrMsg "❌ Sin Internet. Abortando Windows Update."
         return
     }
 
-    # Reiniciar servicios de Windows Update
-    Write-Host "🔄 Reiniciando servicios de Windows Update..." -ForegroundColor Yellow
-    $services = @("wuauserv", "cryptsvc")
-    Try {
-        $services | ForEach-Object {
-            Stop-Service -Name $_ -Force -ErrorAction SilentlyContinue
-            Start-Service -Name $_ -ErrorAction Stop
-            Write-Host "✅ Servicio $_ reiniciado correctamente." -ForegroundColor Green
+    # Reinicio de servicios base
+    $services = @("wuauserv","cryptsvc")
+    Write-WarnMsg "🔄 Reiniciando servicios de Windows Update..."
+    foreach ($s in $services) {
+        try {
+            Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+            Start-Service -Name $s -ErrorAction Stop
+            Write-Ok "✅ Servicio $s reiniciado."
+        } catch {
+            Write-WarnMsg "⚠️ No se pudo reiniciar ${s}: $($_.Exception.Message)"
         }
-    } Catch {
-        Write-Host "⚠️ No se pudieron reiniciar algunos servicios: $_" -ForegroundColor Yellow
     }
 
-    # Instalar o importar PSWindowsUpdate
-    if (!(Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-        Write-Host "📥 Instalando módulo PSWindowsUpdate..." -ForegroundColor Yellow
-        Try {
-            Install-Module PSWindowsUpdate -Force -Scope CurrentUser -AllowClobber
-            Import-Module PSWindowsUpdate
-        } Catch {
-            Write-Host "❌ Error al instalar PSWindowsUpdate: $_" -ForegroundColor Red
-            return
-        }
-    } else {
-        Import-Module PSWindowsUpdate -ErrorAction SilentlyContinue
-    }
-
-    # Buscar e instalar actualizaciones
-    Write-Host "🔍 Buscando actualizaciones de Windows y drivers..." -ForegroundColor Yellow
+    # PSWindowsUpdate
     try {
+        Ensure-NuGetProvider
+        if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+            Write-WarnMsg "📥 Instalando módulo PSWindowsUpdate..."
+            Install-Module PSWindowsUpdate -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        }
+        Import-Module PSWindowsUpdate -ErrorAction Stop
+        Write-Info "🔍 Buscando e instalando actualizaciones..."
         Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot | Out-Null
-        Write-Host "✅ Actualizaciones instaladas correctamente." -ForegroundColor Green
+        Write-Ok "✅ Actualizaciones instaladas correctamente."
     } catch {
-        Write-Host "❌ Error durante la actualización de Windows y drivers: $_" -ForegroundColor Red
+        Write-ErrMsg "❌ Error con PSWindowsUpdate: $($_.Exception.Message)"
     }
 
-    # Verificar si es necesario reiniciar
     if (Get-PendingReboot) {
-        Write-Host "⚠️ Se requiere reiniciar el sistema para aplicar cambios." -ForegroundColor Yellow
+        Write-WarnMsg "⚠️ Se requiere reiniciar el sistema para aplicar cambios."
     } else {
-        Write-Host "✅ No es necesario reiniciar el sistema." -ForegroundColor Green
+        Write-Ok "✅ No es necesario reiniciar."
     }
 }
 
-# Función para verificar si se requiere reinicio del sistema
+# Chequeo de reinicio pendiente
 function Get-PendingReboot {
-    Write-Host "🔄 Verificando si es necesario reiniciar el equipo..." -ForegroundColor Yellow
-
     $keys = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
         'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
     )
-
-    foreach ($key in $keys) {
-        if (Test-Path $key) {
-            Write-Host "⚠️ Se requiere reiniciar el sistema para aplicar cambios." -ForegroundColor Yellow
-            return $true
-        }
-    }
-
-    Write-Host "✅ No es necesario reiniciar el sistema." -ForegroundColor Green
+    foreach ($k in $keys) { if (Test-Path $k) { return $true } }
     return $false
 }
 
-# Main execution
-Write-Host "Iniciando actualizaciones automáticas de aplicaciones y drivers..." -ForegroundColor Cyan
+# -------------------------
+# Main
+# -------------------------
+$AutoRelaunchToPwsh = -not $NoRelaunch
+if ($AutoRelaunchToPwsh) { Ensure-PowerShell7 -NoRelaunch:$NoRelaunch | Out-Null }
+
+Write-Info "Iniciando actualizaciones automáticas de aplicaciones y del sistema..."
+if (-not (Test-IsAdmin)) {
+    Write-WarnMsg "ℹ️ Sugerencia: ejecuta como Administrador para mejores resultados (servicios, WU, etc.)."
+}
+
 Update-RuckZuckApps
-Update-WingetApps
+Update-WinGetApps
 Update-MicrosoftStore
 Update-WindowsDriversAndUpdates
+
+Write-Ok "✅ Proceso finalizado."
