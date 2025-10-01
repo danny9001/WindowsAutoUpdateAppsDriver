@@ -19,6 +19,10 @@
 .NOTES
   - En Windows Server se omiten tareas de Microsoft Store.
   - Requiere privilegios de admin para partes de Windows Update e instalación de PS7.
+
+.PowerShell Excecution
+  - Set-ExecutionPolicy Unrestricted -Scope Process -Force
+  - Set-ExecutionPolicy Unrestricted
 #>
 
 [CmdletBinding()]
@@ -473,3 +477,4 @@ Update-WindowsDriversAndUpdates
 
 Write-Ok "✅ Proceso finalizado."
 try { Stop-Transcript | Out-Null } catch {}
+
