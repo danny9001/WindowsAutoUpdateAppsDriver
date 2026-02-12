@@ -58,6 +58,39 @@ try { Start-Transcript -Path $tsFile -ErrorAction SilentlyContinue | Out-Null } 
 #endregion
 
 #region Funciones de red y sistema
+function Invoke-Download {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$Uri,
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [string]$ExpectedChecksum,
+        [string]$ChecksumAlgorithm = 'SHA256'
+    )
+    Set-Tls12Enable; Set-ProxyDefaults
+    
+    $iwrParams = @{ Uri = $Uri; OutFile = $OutFile; ErrorAction = 'Stop' }
+    if ($PSVersionTable.PSVersion.Major -lt 7) { $iwrParams.UseBasicParsing = $true }
+    
+    try {
+        Invoke-WebRequest @iwrParams
+    } catch {
+        throw "Error descargando '$Uri': $($_.Exception.Message)"
+    }
+
+    if (-not ([string]::IsNullOrEmpty($ExpectedChecksum))) {
+        try {
+            $hash = (Get-FileHash -Path $OutFile -Algorithm $ChecksumAlgorithm).Hash.ToLower()
+            if ($hash -ne $ExpectedChecksum.ToLower()) {
+                throw "Checksum Invalido. Esperado: $ExpectedChecksum, Calculado: $hash"
+            }
+            Write-Info "Checksum verificado para $(Split-Path $OutFile -Leaf)."
+        } catch {
+            throw "Error verificando checksum para '$OutFile': $($_.Exception.Message)"
+        }
+    }
+    return (Get-Item $OutFile)
+}
+
 function Set-Tls12Enable {
     try {
         if ($PSVersionTable.PSVersion.Major -lt 7) {
@@ -198,12 +231,14 @@ function Install-PowerShell7 {
 
         $msiPath = Join-Path $OutputFolder $asset.name
         Write-Info "Descargando $($asset.name)..."
-        $iwr = @{ Uri = $asset.browser_download_url; OutFile = $msiPath; ErrorAction = 'Stop' }
-        if ($PSVersionTable.PSVersion.Major -lt 7) { $iwr.UseBasicParsing = $true }
-        Invoke-WebRequest @iwr
+        Invoke-Download -Uri $asset.browser_download_url -OutFile $msiPath
 
         Write-Info "Instalando PowerShell 7..."
-        Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait
+        $proc = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -PassThru
+        if ($proc.ExitCode -ne 0) {
+            throw "El instalador de PowerShell 7 finalizo con codigo de error: $($proc.ExitCode)."
+        }
+
         Start-Sleep -Seconds 3
 
         if (Get-Command pwsh -ErrorAction SilentlyContinue) {
@@ -253,25 +288,30 @@ function Install-VCRedist {
 
         $vcPath = Join-Path $tempVC "vc_redist.$arch.exe"
         Write-Info "Descargando VC++ Redistributable ($arch)..."
-        $iwr = @{ Uri = $vcUrl; OutFile = $vcPath; ErrorAction = 'Stop' }
-        if ($PSVersionTable.PSVersion.Major -lt 7) { $iwr.UseBasicParsing = $true }
-        Invoke-WebRequest @iwr
+        Invoke-Download -Uri $vcUrl -OutFile $vcPath
 
         Write-Info "Ejecutando instalador..."
-        Start-Process -FilePath $vcPath -ArgumentList '/install', '/quiet', '/norestart' -Wait
-
-        Remove-Item $tempVC -Recurse -Force -ErrorAction SilentlyContinue
+        $proc = Start-Process -FilePath $vcPath -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+        if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) { # 3010 = Reboot required
+            throw "El instalador de VC++ finalizo con codigo de error: $($proc.ExitCode)."
+        }
 
         if (Test-VCRedistInstalled) {
             Write-Ok "VC++ Redistributable instalado correctamente."
+            if ($proc.ExitCode -eq 3010) { Write-WarnMsg "Se requiere reinicio para completar la instalacion de VC++." }
             return $true
         }
-        Write-WarnMsg "No se pudo verificar la instalacion de VC++."
+        
+        Write-WarnMsg "No se pudo verificar la instalacion de VC++ (puede requerir reinicio)."
         return $false
+
     } catch {
         Write-ErrMsg "Error instalando VC++ Redistributable: $($_.Exception.Message)"
-        Remove-Item $tempVC -Recurse -Force -ErrorAction SilentlyContinue
         return $false
+    } finally {
+        if (Test-Path $tempVC) {
+            Remove-Item $tempVC -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 #endregion
