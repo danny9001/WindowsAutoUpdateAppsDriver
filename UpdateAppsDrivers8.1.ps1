@@ -27,6 +27,7 @@
   - En Windows Server se omiten tareas de Microsoft Store
   - Requiere privilegios de admin para WinGet install y Windows Update
   - Manejo de errores mejorado para WinGet y VC++ Redistributable
+  - Actualiza WinGet paquete por paquete, con fallback JSON/texto y recuperacion de instaladores especiales
 #>
 
 [CmdletBinding()]
@@ -536,13 +537,71 @@ function Update-RuckZuckApps {
 #region WinGet Updates
 function Ensure-WinGetSources {
     try {
+        Write-Info "Actualizando y restableciendo fuentes de WinGet..."
         Invoke-WinGet source update --disable-interactivity 2>$null | Out-Null
         Invoke-WinGet source reset --disable-interactivity 2>$null | Out-Null
-    } catch { }
+    } catch { Write-WarnMsg "No se pudieron preparar las fuentes de WinGet: $($_.Exception.Message)" }
+}
+
+function Get-WinGetUpgradesList {
+    $text = Invoke-WinGet upgrade --accept-source-agreements --include-unknown --disable-interactivity 2>$null | Out-String
+    return @($text -split "`r?`n" | Where-Object { $_ -match '^\S' })
+}
+
+function Get-WinGetUpgradeIds {
+    # En versiones recientes WinGet ofrece JSON; se intenta primero y se conserva el parser de texto para versiones antiguas.
+    try {
+        $json = Invoke-WinGet upgrade --accept-source-agreements --include-unknown --output json --disable-interactivity 2>$null | Out-String
+        if (-not [string]::IsNullOrWhiteSpace($json)) {
+            $data = $json | ConvertFrom-Json -ErrorAction Stop
+            $upgrades = if ($data.PSObject.Properties.Name -contains 'Upgrades') { @($data.Upgrades) } else { @($data) }
+            $ids = foreach ($upgrade in $upgrades) {
+                if ($upgrade.Package -and $upgrade.Package.PackageIdentifier) { $upgrade.Package.PackageIdentifier }
+                elseif ($upgrade.PackageIdentifier) { $upgrade.PackageIdentifier }
+                elseif ($upgrade.Id) { $upgrade.Id }
+            }
+            $ids = @($ids | Where-Object { $_ -match '^[\w\.\-]+$' } | Select-Object -Unique)
+            if ($ids.Count -gt 0) { return $ids }
+        }
+    } catch {
+        Write-WarnMsg "La salida JSON de WinGet no esta disponible; se usara el formato de texto."
+    }
+
+    # Fallback compatible con WinGet anterior: las columnas se localizan por posición, no por separación de espacios.
+    $idStart = -1; $versionStart = -1
+    $ids = foreach ($raw in (Get-WinGetUpgradesList)) {
+        $line = $raw.TrimEnd()
+        if ($line -match '^(Name|Nombre)\s+(Id|Identificador)\s+(Version|Versi.n)') {
+            $idStart = $line.IndexOf('Id')
+            if ($idStart -lt 0) { $idStart = $line.IndexOf('Identificador') }
+            $versionStart = [Math]::Max($line.IndexOf('Version'), $line.IndexOf('Versi'))
+            continue
+        }
+        if ($idStart -lt 0 -or $line -match '^-+$' -or $line -match '\d+\s+(upgrades?|actualizaciones?)\s+(available|disponibles)') { continue }
+        if ($line -match '^(No\s|The following|No se)') { continue }
+        if ($line.Length -le $idStart) { continue }
+        $length = if ($versionStart -gt $idStart -and $line.Length -ge $versionStart) { $versionStart - $idStart } else { $line.Length - $idStart }
+        $line.Substring($idStart, $length).Trim()
+    }
+    return @($ids | Where-Object { $_ -match '^[\w\.\-]+$' } | Select-Object -Unique)
+}
+
+function Invoke-EdgeUpdater {
+    $edgeUpdater = @(
+        "${env:ProgramFiles(x86)}\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe",
+        "$env:ProgramFiles\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe"
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+    if (-not $edgeUpdater) {
+        Write-WarnMsg 'No se encontro MicrosoftEdgeUpdate.exe; Edge debe actualizarse manualmente.'
+        return
+    }
+    Start-Process -FilePath $edgeUpdater -ArgumentList '/ua /installsource scheduler' -Wait -NoNewWindow
+    Write-Ok 'Se inicio el actualizador integrado de Microsoft Edge.'
 }
 
 function Update-WinGetApps {
-    Write-Info "=== Actualizando con WinGet ==="
+    Write-Info "=== Actualizando aplicaciones con WinGet ==="
 
     # Verificar/instalar WinGet
     if (-not (Test-WinGetInstalled) -or $ForceWinGetReinstall) {
@@ -553,7 +612,12 @@ function Update-WinGetApps {
         }
     }
 
-    if (-not (Test-Internet)) {
+    $internet = Test-Internet
+    if (-not $internet) {
+        Write-WarnMsg "Las sondas HTTP fallaron; se comprobara la conectividad con WinGet."
+        try { Invoke-WinGet source list --disable-interactivity | Out-Null; $internet = $true } catch { }
+    }
+    if (-not $internet) {
         Write-ErrMsg "Sin Internet. Omitiendo WinGet."
         return
     }
@@ -562,15 +626,48 @@ function Update-WinGetApps {
 
     try {
         Write-Info "Buscando actualizaciones..."
-        $upgrades = Invoke-WinGet upgrade --accept-source-agreements --include-unknown --disable-interactivity 2>$null
+        $upgrades = Get-WinGetUpgradesList
 
-        if ($upgrades -match 'No installed package found matching') {
+        if (-not $upgrades -or $upgrades -match 'No installed package found matching|No se encontr') {
             Write-Ok "No hay actualizaciones WinGet disponibles."
             return
         }
 
-        Write-Info "Ejecutando 'winget upgrade --all'..."
-        Invoke-WinGet upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+        Write-Info "Aplicaciones con actualizacion (WinGet):"
+        $upgrades | ForEach-Object { Write-Host (" - " + $_) -ForegroundColor White }
+
+        $ids = Get-WinGetUpgradeIds
+        if (-not $ids -or $ids.Count -eq 0) {
+            Write-WarnMsg "No se pudieron extraer los Id; se intentara 'winget upgrade --all'."
+            Invoke-WinGet upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+            Write-Ok "Actualizacion WinGet completada."
+            return
+        }
+
+        # Se actualiza paquete por paquete: un fallo no bloquea las actualizaciones restantes.
+        foreach ($id in $ids) {
+            Write-Info "Actualizando $id..."
+            Invoke-WinGet upgrade --id $id --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "$id actualizado."
+            } elseif ($LASTEXITCODE -eq -1978335090) {
+                Write-WarnMsg "${id}: requiere otra tecnologia de instalacion; se intentara reinstalar."
+                if ($id -eq 'Microsoft.Edge') {
+                    Invoke-EdgeUpdater
+                } else {
+                    Invoke-WinGet uninstall --id $id --silent --disable-interactivity
+                    if ($LASTEXITCODE -eq 0) {
+                        Invoke-WinGet install --id $id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+                        if ($LASTEXITCODE -eq 0) { Write-Ok "$id reinstalado en la version nueva." }
+                        else { Write-WarnMsg "$id se desinstalo, pero la reinstalacion fallo (codigo $LASTEXITCODE)." }
+                    } else {
+                        Write-WarnMsg "No se pudo desinstalar $id (codigo $LASTEXITCODE)."
+                    }
+                }
+            } else {
+                Write-WarnMsg "$id no se pudo actualizar (codigo $LASTEXITCODE); se continuara con los demas paquetes."
+            }
+        }
         Write-Ok "Actualizacion WinGet completada."
     } catch {
         Write-ErrMsg "Error en WinGet: $($_.Exception.Message)"
