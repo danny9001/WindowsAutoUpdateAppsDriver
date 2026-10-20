@@ -289,7 +289,7 @@ function Invoke-Download {
     Set-Tls12Enable; Set-ProxyDefaults
     $params = @{ Uri=$Uri; OutFile=$OutFile; ErrorAction='Stop' }
     if ($PSVersionTable.PSVersion.Major -lt 7) { $params.UseBasicParsing = $true }
-    Invoke-WebRequest @params
+    Invoke-WebRequest @params | Out-Null
 }
 
 function Get-WindowsPowerShellPath {
@@ -397,16 +397,17 @@ function Install-VCRedist {
     }
 }
 
-function Enable-AppSideloading {
+function Test-AppSideloadingPolicy {
     try {
         $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx'
-        New-Item -Path $policyPath -Force | Out-Null
-        Set-ItemProperty -Path $policyPath -Name AllowAllTrustedApps -Type DWord -Value 1 -Force
-        Write-Info 'Se habilito la instalacion de aplicaciones de confianza para AppX/MSIX.'
-        return $true
+        $policy = Get-ItemProperty -LiteralPath $policyPath -ErrorAction Stop
+        if ($policy.AllowAllTrustedApps -eq 0 -and $null -ne $policy.AllowAllTrustedApps) {
+            Write-WarnMsg 'AllowAllTrustedApps=0: la politica del servidor restringe los paquetes AppX. Se intentara instalar respetando esa politica.'
+        } else {
+            Write-Info 'Politica AppX consultada; no se modificara la configuracion del servidor.'
+        }
     } catch {
-        Write-WarnMsg "No se pudo habilitar sideloading AppX: $($_.Exception.Message)"
-        return $false
+        Write-Info 'Sin politica AppX consultable. Se intentara instalar con la configuracion actual del servidor.'
     }
 }
 
@@ -442,7 +443,7 @@ function Install-WinGet {
         return $false
     }
 
-    Enable-AppSideloading | Out-Null
+    Test-AppSideloadingPolicy
     $architecture = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64') { $architecture = 'arm64' }
     $tempFolder = Join-Path $env:TEMP ("WinGetInstall-" + [guid]::NewGuid().ToString())
@@ -450,12 +451,8 @@ function Install-WinGet {
     try {
         Install-VCRedist | Out-Null
         Write-Info 'Descargando WinGet y dependencias para LTSC/Server...'
-        $vclibsPath = Join-Path $tempFolder 'VCLibs.appx'
-        $xamlPath = Join-Path $tempFolder 'UI.Xaml.appx'
         $bundlePath = Join-Path $tempFolder 'WinGet.msixbundle'
         $licensePath = Join-Path $tempFolder 'License.xml'
-        Invoke-Download "https://aka.ms/Microsoft.VCLibs.$architecture.14.00.Desktop.appx" $vclibsPath
-        Invoke-Download "https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.$architecture.appx" $xamlPath
 
         $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -Headers @{ 'User-Agent'='WinGet-Installer' } -ErrorAction Stop
         $bundleUrl = ($release.assets | Where-Object { $_.name -like '*.msixbundle' } | Select-Object -First 1).browser_download_url
@@ -464,9 +461,23 @@ function Install-WinGet {
         Invoke-Download $bundleUrl $bundlePath
         Invoke-Download $licenseUrl $licensePath
 
-        foreach ($dependency in @($vclibsPath, $xamlPath)) {
+        # Usar las dependencias de la misma release: WinGet 1.29 requiere WindowsAppRuntime 1.8.
+        $dependencyAsset = $release.assets | Where-Object { $_.name -eq 'DesktopAppInstaller_Dependencies.zip' } | Select-Object -First 1
+        if (-not $dependencyAsset) { throw 'La release no publica DesktopAppInstaller_Dependencies.zip.' }
+        $dependencyZip = Join-Path $tempFolder 'Dependencies.zip'
+        $dependencyFolder = Join-Path $tempFolder 'Dependencies'
+        Write-Info "Descargando dependencias oficiales de WinGet $($release.tag_name) ($architecture)..."
+        Invoke-Download $dependencyAsset.browser_download_url $dependencyZip
+        Expand-Archive -LiteralPath $dependencyZip -DestinationPath $dependencyFolder -ErrorAction Stop
+        $architectureFolder = Join-Path $dependencyFolder $architecture
+        $dependencies = @(Get-ChildItem -LiteralPath $architectureFolder -File -Recurse -ErrorAction Stop |
+            Where-Object { $_.Extension -in @('.appx', '.msix') } | Sort-Object Name)
+        if ($dependencies.Count -eq 0) { throw "No se encontraron dependencias para $architecture." }
+        foreach ($dependencyFile in $dependencies) {
+            $dependency = $dependencyFile.FullName
+            Write-Info "Instalando dependencia: $($dependencyFile.Name)..."
             $escapedPath = $dependency.Replace("'", "''")
-            try { Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedPath' -ErrorAction Stop" } catch { Write-WarnMsg "Dependencia ya presente o no reinstalada: $(Split-Path $dependency -Leaf)" }
+            try { Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedPath' -ErrorAction Stop" } catch { Write-WarnMsg "No se pudo instalar $($dependencyFile.Name): $($_.Exception.Message)" }
             try { Invoke-WindowsPowerShellCommand "Add-AppxProvisionedPackage -Online -PackagePath '$escapedPath' -SkipLicense -ErrorAction Stop | Out-Null" } catch { Write-WarnMsg "No se pudo aprovisionar: $(Split-Path $dependency -Leaf)" }
         }
         $escapedBundle = $bundlePath.Replace("'", "''")
@@ -475,8 +486,7 @@ function Install-WinGet {
         Invoke-WindowsPowerShellCommand "Add-AppxProvisionedPackage -Online -PackagePath '$escapedBundle' -LicensePath '$escapedLicense' -ErrorAction Stop | Out-Null"
         Start-Sleep -Seconds 3
         if (Test-WinGetInstalled) { Write-Ok 'WinGet instalado y verificado.'; return $true }
-        Write-ErrMsg 'WinGet no pudo verificarse despues de la instalacion.'
-        return $false
+        throw 'WinGet no pudo verificarse despues de la instalacion.'
     } catch {
         Write-WarnMsg "La instalacion AppX directa fallo: $($_.Exception.Message)"
         if (Install-WinGetWithClientModule) { return $true }
