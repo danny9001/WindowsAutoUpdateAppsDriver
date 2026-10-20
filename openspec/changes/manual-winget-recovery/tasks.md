@@ -1,0 +1,4 @@
+- [x] Documentar propuesta y diseno antes de codigo.
+- [x] Implementar menu, registro y llamadas desde fallos.
+- [x] Probar menus y ejecucion programada, con regresiones (WinGetRecovery, WinGetContinuation y ScheduledTask: PASS).
+- [x] Preparar publicacion y sincronizacion de copia local.

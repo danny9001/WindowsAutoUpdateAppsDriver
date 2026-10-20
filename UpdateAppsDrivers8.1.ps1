@@ -545,6 +545,45 @@ function Get-WinGetUpgradeIds {
     return @($ids | Where-Object { $_ -match '^[\w\.\+\-]+$' } | Select-Object -Unique)
 }
 
+function Resolve-WinGetFailure {
+    param(
+        [Parameter(Mandatory=$true)][string]$Id,
+        [string]$Details,
+        [ValidateSet('upgrade','install')][string]$Operation = 'upgrade'
+    )
+    # El ID se obtiene de la tabla WinGet; escapar comillas para el comando copiable.
+    $quotedId = $Id.Replace("'", "''")
+    $manualCommand = "winget $Operation --id '$quotedId' --exact --interactive --accept-package-agreements --accept-source-agreements"
+    $diagnosticFolder = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir'
+    try {
+        $recoveryFile = Join-Path $OutputFolder 'WinGet-Recuperacion-manual.log'
+        @("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Id", $Details, "Comando: $manualCommand", "Transcript: $tsFile", "Diagnosticos WinGet: $diagnosticFolder", '') |
+            Add-Content -LiteralPath $recoveryFile -Encoding UTF8 -ErrorAction Stop
+        Write-Info "Comando y error guardados en $recoveryFile"
+    } catch { Write-WarnMsg "No se pudo guardar la recuperacion: $($_.Exception.Message)" }
+
+    if ($ScheduledRun -or -not [Environment]::UserInteractive) {
+        Write-WarnMsg "Recuperacion manual pendiente para ${Id}: $manualCommand"
+        return
+    }
+    Write-Host "No se pudo completar ${Id}. Opciones:"
+    Write-Host '  1. Reintentar con WinGet y el instalador visible'
+    Write-Host '  2. Mostrar comando para ejecutarlo manualmente despues'
+    Write-Host '  3. Omitir y continuar con los demas paquetes'
+    do { $choice = (Read-Host 'Seleccione una opcion (1-3)').Trim() } while ($choice -notmatch '^[1-3]$')
+    if ($choice -eq '2') { Write-Host $manualCommand -ForegroundColor Cyan; return }
+    if ($choice -ne '1') { return }
+    try {
+        Write-Info "Reintentando ${Id} con instalador interactivo..."
+        Invoke-WinGet $Operation --id $Id --exact --interactive --accept-package-agreements --accept-source-agreements | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -eq 0) { Write-Ok "$Id completado mediante instalacion interactiva." }
+        else {
+            Write-WarnMsg "El reintento de $Id fallo (codigo $LASTEXITCODE). Comando manual: $manualCommand"
+            "Reintento de ${Id}: codigo $LASTEXITCODE" | Add-Content -LiteralPath $recoveryFile -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
+    } catch { Write-WarnMsg "Error al reintentar ${Id}: $($_.Exception.Message). Comando manual: $manualCommand" }
+}
+
 function Update-WinGetApps {
     Write-Info "=== Actualizando aplicaciones con WinGet... ==="
     if (-not (Test-WinGetInstalled) -or $ForceWinGetReinstall) {
@@ -587,7 +626,9 @@ function Update-WinGetApps {
         foreach ($id in $ids) {
             try {
             Write-Info "🔄 Actualizando $id..."
-            Invoke-WinGet upgrade --id $id --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+            $packageOutput = [Collections.Generic.List[string]]::new()
+            Invoke-WinGet upgrade --id $id --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity 2>&1 |
+                ForEach-Object { $packageOutput.Add([string]$_); Write-Host $_ }
             if ($LASTEXITCODE -eq 0) {
                 Write-Ok "✅ $id actualizado."
             } elseif ($LASTEXITCODE -eq -1978335090) {
@@ -604,16 +645,19 @@ function Update-WinGetApps {
                     if ($LASTEXITCODE -eq 0) {
                         Invoke-WinGet install --id $id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
                         if ($LASTEXITCODE -eq 0) { Write-Ok "✅ $id reinstalado en la versión nueva." }
-                        else { Write-WarnMsg "⚠️ $id se desinstaló pero la reinstalación falló (código $LASTEXITCODE). Reinstálalo manualmente." }
+                        else { Resolve-WinGetFailure -Id $id -Operation install -Details "Reinstalacion fallida: codigo $LASTEXITCODE" }
                     } else {
                         Write-WarnMsg "⚠️ No se pudo desinstalar $id (código $LASTEXITCODE). Continúo."
+                        Resolve-WinGetFailure -Id $id -Details "No se pudo desinstalar: codigo $LASTEXITCODE"
                     }
                 }
             } else {
                 Write-WarnMsg "⚠️ $id no se pudo actualizar (código $LASTEXITCODE). Continúo con el resto."
+                Resolve-WinGetFailure -Id $id -Details ("Codigo: $LASTEXITCODE`n" + ($packageOutput -join [Environment]::NewLine))
             }
             } catch {
                 Write-WarnMsg "⚠️ Error procesando ${id}: $($_.Exception.Message). Continúo con el resto."
+                Resolve-WinGetFailure -Id $id -Details $_.Exception.Message
             }
         }
         Write-Ok "✅ Actualización WinGet completada."

@@ -24,6 +24,7 @@ function Write-ErrMsg($msg) { throw $msg }
 function Test-WinGetInstalled { return $true }
 function Test-Internet { param([switch]$VerboseMode) return $true }
 function Ensure-WinGetSources {}
+function Resolve-WinGetFailure { param($Id,$Details,$Operation) }
 function Get-WinGetUpgradesList { return $script:Lines }
 function Invoke-WinGet {
     $id=$args[2]
