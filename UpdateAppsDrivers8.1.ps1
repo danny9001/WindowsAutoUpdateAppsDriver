@@ -9,7 +9,8 @@
   No relanzar en pwsh aunque PS sea < 7.
 
 .PARAMETER AutoInstallPwsh
-  Si PS < 7 y no hay pwsh, instalar automaticamente PowerShell 7 y relanzar.
+  Compatibilidad con versiones previas. PowerShell 7 se instala automaticamente si se ejecuta con PowerShell 5.1,
+  salvo que se indique -NoRelaunch.
 
 .PARAMETER SkipStore
   Omitir pasos de Microsoft Store incluso en equipos cliente.
@@ -23,6 +24,7 @@
 .NOTES
   v8.1 - Combinacion de UpdateAppsDrivers + Reinstalar-WinGet
   - Instala VC++ Redistributable automaticamente si falta
+  - Instala y relanza PowerShell 7 automaticamente cuando se inicia desde PowerShell 5.1
   - Instala WinGet y dependencias automaticamente si faltan
   - En Windows Server se omiten tareas de Microsoft Store
   - Requiere privilegios de admin para WinGet install y Windows Update
@@ -793,15 +795,18 @@ Write-Host " Admin:       $(if (Test-IsAdmin) { 'Si' } else { 'No' })"
 Write-Host " Carpeta:     $OutputFolder"
 Write-Host ""
 
-# Verificar/instalar PS7
+# PowerShell 7 es obligatorio para ejecutar la version completa del script.
+# En PowerShell 5.1 se relanza si ya existe; de lo contrario se instala automaticamente.
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     $relaunched = Ensure-PowerShell7 -NoRelaunch:$NoRelaunch
-    if (-not $relaunched -and $AutoInstallPwsh) {
+    if (-not $relaunched -and -not $NoRelaunch) {
         if (Install-PowerShell7) {
             Ensure-PowerShell7 | Out-Null
         } else {
             Write-WarnMsg "Continuando en Windows PowerShell 5.1."
         }
+    } elseif ($NoRelaunch) {
+        Write-WarnMsg "-NoRelaunch solicitado: continuando en Windows PowerShell 5.1."
     }
 }
 
