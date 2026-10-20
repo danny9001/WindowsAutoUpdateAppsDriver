@@ -292,6 +292,28 @@ function Invoke-Download {
     Invoke-WebRequest @params
 }
 
+function Get-WindowsPowerShellPath {
+    $path = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path -LiteralPath $path) { return $path }
+    return $null
+}
+
+function Test-AppxDeploymentAvailable {
+    $windowsPowerShell = Get-WindowsPowerShellPath
+    if (-not $windowsPowerShell) { return $false }
+    & $windowsPowerShell -NoProfile -NonInteractive -Command "if ((Get-Command Add-AppxPackage -ErrorAction SilentlyContinue) -and (Get-Command Add-AppxProvisionedPackage -ErrorAction SilentlyContinue)) { exit 0 }; exit 1" 2>$null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Invoke-WindowsPowerShellCommand {
+    param([Parameter(Mandatory=$true)][string]$Command)
+    $windowsPowerShell = Get-WindowsPowerShellPath
+    if (-not $windowsPowerShell) { throw 'Windows PowerShell 5.1 no esta disponible.' }
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+    & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedCommand
+    if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell devolvio el codigo $LASTEXITCODE." }
+}
+
 function Get-WinGetExecutable {
     if ($script:WinGetExecutable -and (Test-Path -LiteralPath $script:WinGetExecutable)) { return $script:WinGetExecutable }
     $command = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -302,11 +324,18 @@ function Get-WinGetExecutable {
     }
 
     # Server/SYSTEM no siempre tienen el alias de WindowsApps; usar la ubicacion real del paquete.
-    if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) { return $null }
-    $package = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue |
-        Sort-Object Version -Descending | Select-Object -First 1
-    if ($package -and $package.InstallLocation) {
-        $candidate = Join-Path $package.InstallLocation 'winget.exe'
+    $packageLocation = $null
+    if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
+        $package = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue |
+            Sort-Object Version -Descending | Select-Object -First 1
+        if ($package) { $packageLocation = $package.InstallLocation }
+    } elseif (Test-AppxDeploymentAvailable) {
+        # Los cmdlets AppX suelen estar disponibles solo en Windows PowerShell 5.1, no en pwsh.
+        $windowsPowerShell = Get-WindowsPowerShellPath
+        $packageLocation = & $windowsPowerShell -NoProfile -NonInteractive -Command "(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).InstallLocation" 2>$null | Select-Object -First 1
+    }
+    if ($packageLocation) {
+        $candidate = Join-Path $packageLocation 'winget.exe'
         if (Test-Path -LiteralPath $candidate) {
             $script:WinGetExecutable = $candidate
             return $script:WinGetExecutable
@@ -344,11 +373,31 @@ function Confirm-WinGetInstallation {
     return ($answer -match '^(?i:s|si|y|yes)$')
 }
 
+function Install-VCRedist {
+    $architecture = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+    if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64') { $architecture = 'arm64' }
+    $tempFolder = Join-Path $env:TEMP ("VCRedist-" + [guid]::NewGuid().ToString())
+    try {
+        New-Item -ItemType Directory -Path $tempFolder -Force | Out-Null
+        $installer = Join-Path $tempFolder "vc_redist.$architecture.exe"
+        Write-Info "Descargando Visual C++ Redistributable ($architecture)..."
+        Invoke-Download "https://aka.ms/vs/17/release/vc_redist.$architecture.exe" $installer
+        $process = Start-Process -FilePath $installer -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+        if ($process.ExitCode -notin @(0, 3010)) { throw "El instalador VC++ devolvio el codigo $($process.ExitCode)." }
+        Write-Ok 'Visual C++ Redistributable instalado.'
+        return $true
+    } catch {
+        Write-WarnMsg "No se pudo instalar Visual C++ Redistributable: $($_.Exception.Message)"
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-WinGet {
     if (-not (Test-IsAdmin)) { Write-ErrMsg 'Se requiere Admin para instalar WinGet.'; return $false }
     if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg 'Sin Internet para instalar WinGet.'; return $false }
-    if (-not (Get-Command Add-AppxPackage -ErrorAction SilentlyContinue) -or
-        -not (Get-Command Add-AppxProvisionedPackage -ErrorAction SilentlyContinue)) {
+    if (-not (Test-AppxDeploymentAvailable)) {
         $installationType = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).InstallationType
         if ($installationType -match 'Core') {
             Write-ErrMsg 'Windows Server Core no es compatible con WinGet: requiere MSIX/AppX y Desktop Experience.'
@@ -363,6 +412,7 @@ function Install-WinGet {
     $tempFolder = Join-Path $env:TEMP ("WinGetInstall-" + [guid]::NewGuid().ToString())
     New-Item -ItemType Directory -Path $tempFolder -Force | Out-Null
     try {
+        Install-VCRedist | Out-Null
         Write-Info 'Descargando WinGet y dependencias para LTSC/Server...'
         $vclibsPath = Join-Path $tempFolder 'VCLibs.appx'
         $xamlPath = Join-Path $tempFolder 'UI.Xaml.appx'
@@ -379,11 +429,14 @@ function Install-WinGet {
         Invoke-Download $licenseUrl $licensePath
 
         foreach ($dependency in @($vclibsPath, $xamlPath)) {
-            try { Add-AppxPackage -Path $dependency -ErrorAction Stop } catch { Write-WarnMsg "Dependencia ya presente o no reinstalada: $(Split-Path $dependency -Leaf)" }
-            try { Add-AppxProvisionedPackage -Online -PackagePath $dependency -SkipLicense -ErrorAction Stop | Out-Null } catch { Write-WarnMsg "No se pudo aprovisionar: $(Split-Path $dependency -Leaf)" }
+            $escapedPath = $dependency.Replace("'", "''")
+            try { Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedPath' -ErrorAction Stop" } catch { Write-WarnMsg "Dependencia ya presente o no reinstalada: $(Split-Path $dependency -Leaf)" }
+            try { Invoke-WindowsPowerShellCommand "Add-AppxProvisionedPackage -Online -PackagePath '$escapedPath' -SkipLicense -ErrorAction Stop | Out-Null" } catch { Write-WarnMsg "No se pudo aprovisionar: $(Split-Path $dependency -Leaf)" }
         }
-        Add-AppxPackage -Path $bundlePath -ErrorAction Stop
-        Add-AppxProvisionedPackage -Online -PackagePath $bundlePath -LicensePath $licensePath -ErrorAction Stop | Out-Null
+        $escapedBundle = $bundlePath.Replace("'", "''")
+        $escapedLicense = $licensePath.Replace("'", "''")
+        Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedBundle' -ErrorAction Stop"
+        Invoke-WindowsPowerShellCommand "Add-AppxProvisionedPackage -Online -PackagePath '$escapedBundle' -LicensePath '$escapedLicense' -ErrorAction Stop | Out-Null"
         Start-Sleep -Seconds 3
         if (Test-WinGetInstalled) { Write-Ok 'WinGet instalado y verificado.'; return $true }
         Write-ErrMsg 'WinGet no pudo verificarse despues de la instalacion.'
