@@ -331,12 +331,30 @@ function Test-WinGetInstalled {
     } catch { return $false }
 }
 
+function Confirm-WinGetInstallation {
+    if (-not [Environment]::UserInteractive) {
+        Write-WarnMsg 'WinGet no esta instalado y esta ejecucion no tiene interfaz para solicitar confirmacion.'
+        return $false
+    }
+
+    do {
+        $answer = Read-Host 'WinGet no esta instalado. Desea instalarlo ahora? [S/N]'
+    } while ($answer -notmatch '^(?i:s|si|y|yes|n|no)$')
+
+    return ($answer -match '^(?i:s|si|y|yes)$')
+}
+
 function Install-WinGet {
     if (-not (Test-IsAdmin)) { Write-ErrMsg 'Se requiere Admin para instalar WinGet.'; return $false }
     if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg 'Sin Internet para instalar WinGet.'; return $false }
     if (-not (Get-Command Add-AppxPackage -ErrorAction SilentlyContinue) -or
         -not (Get-Command Add-AppxProvisionedPackage -ErrorAction SilentlyContinue)) {
-        Write-ErrMsg 'Faltan los cmdlets AppX. Se requiere Windows 10/11 o Windows Server 2019 LTSC o posterior con Desktop Experience.'
+        $installationType = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).InstallationType
+        if ($installationType -match 'Core') {
+            Write-ErrMsg 'Windows Server Core no es compatible con WinGet: requiere MSIX/AppX y Desktop Experience.'
+        } else {
+            Write-ErrMsg 'Faltan los cmdlets AppX. Se requiere Windows 10/11 o Windows Server 2019 LTSC o posterior con Desktop Experience.'
+        }
         return $false
     }
 
@@ -422,6 +440,11 @@ function Update-WinGetApps {
     Write-Info "=== Actualizando aplicaciones con WinGet... ==="
     if (-not (Test-WinGetInstalled) -or $ForceWinGetReinstall) {
         Write-WarnMsg "WinGet no esta disponible o se solicito reinstalacion."
+        $installApproved = $ForceWinGetReinstall -or (Confirm-WinGetInstallation)
+        if (-not $installApproved) {
+            Write-WarnMsg 'Instalacion de WinGet omitida por el usuario.'
+            return
+        }
         if (-not (Install-WinGet)) {
             Write-ErrMsg "❌ WinGet no está instalado o disponible en este sistema. Omitiendo."
             return
