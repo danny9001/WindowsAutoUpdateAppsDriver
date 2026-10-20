@@ -410,6 +410,25 @@ function Enable-AppSideloading {
     }
 }
 
+function Install-WinGetWithClientModule {
+    try {
+        Write-Info 'Intentando reparar WinGet con Microsoft.WinGet.Client...'
+        Set-Tls12Enable
+        if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
+            Install-PackageProvider -Name NuGet -Force -Scope AllUsers -ErrorAction Stop | Out-Null
+        }
+        Install-Module -Name Microsoft.WinGet.Client -Repository PSGallery -Scope AllUsers -Force -AllowClobber -ErrorAction Stop | Out-Null
+        Import-Module Microsoft.WinGet.Client -Force -ErrorAction Stop
+        Repair-WinGetPackageManager -AllUsers -Latest -Force -ErrorAction Stop | Out-Null
+        Start-Sleep -Seconds 3
+        if (Test-WinGetInstalled) { Write-Ok 'WinGet instalado mediante Microsoft.WinGet.Client.'; return $true }
+        throw 'La reparacion termino sin que se pudiera verificar winget.exe.'
+    } catch {
+        Write-WarnMsg "El fallback Microsoft.WinGet.Client fallo: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Install-WinGet {
     if (-not (Test-IsAdmin)) { Write-ErrMsg 'Se requiere Admin para instalar WinGet.'; return $false }
     if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg 'Sin Internet para instalar WinGet.'; return $false }
@@ -459,7 +478,9 @@ function Install-WinGet {
         Write-ErrMsg 'WinGet no pudo verificarse despues de la instalacion.'
         return $false
     } catch {
-        Write-ErrMsg "Error instalando WinGet: $($_.Exception.Message)"
+        Write-WarnMsg "La instalacion AppX directa fallo: $($_.Exception.Message)"
+        if (Install-WinGetWithClientModule) { return $true }
+        Write-ErrMsg 'No se pudo instalar WinGet mediante AppX ni Microsoft.WinGet.Client.'
         return $false
     } finally {
         Remove-Item -LiteralPath $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
