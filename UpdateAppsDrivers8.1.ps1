@@ -318,20 +318,48 @@ function Install-VCRedist {
 #endregion
 
 #region WinGet Installation
-function Test-WinGetInstalled {
-    $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if ($winget) {
-        try {
-            $version = & winget --version 2>$null
-            if ($LASTEXITCODE -eq 0 -and $version) { return $true }
-        } catch { }
+$script:WinGetExecutable = $null
+
+function Get-WinGetExecutable {
+    if ($script:WinGetExecutable -and (Test-Path -LiteralPath $script:WinGetExecutable)) {
+        return $script:WinGetExecutable
     }
 
-    # Verificar ruta alternativa
-    if (Test-Path 'C:\WinGet\winget.exe') {
+    $command = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $command) { $command = Get-Command winget -ErrorAction SilentlyContinue }
+    if ($command -and $command.Source -and (Test-Path -LiteralPath $command.Source)) {
+        $script:WinGetExecutable = $command.Source
+        return $script:WinGetExecutable
+    }
+
+    # En Server y tareas ejecutadas como SYSTEM no siempre se crea el alias de WindowsApps.
+    if (-not (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue)) { return $null }
+    $package = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue |
+        Sort-Object Version -Descending | Select-Object -First 1
+    if ($package -and $package.InstallLocation) {
+        $candidate = Join-Path $package.InstallLocation 'winget.exe'
+        if (Test-Path -LiteralPath $candidate) {
+            $script:WinGetExecutable = $candidate
+            return $script:WinGetExecutable
+        }
+    }
+    return $null
+}
+
+function Invoke-WinGet {
+    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
+
+    $executable = Get-WinGetExecutable
+    if (-not $executable) { throw 'WinGet no esta instalado o no se encontro winget.exe.' }
+    & $executable @Arguments
+}
+
+function Test-WinGetInstalled {
+    $winget = Get-WinGetExecutable
+    if ($winget) {
         try {
-            $version = & 'C:\WinGet\winget.exe' --version 2>$null
-            if ($LASTEXITCODE -eq 0) { return $true }
+            $version = & $winget --version 2>$null
+            if ($LASTEXITCODE -eq 0 -and $version) { return $true }
         } catch { }
     }
     return $false
@@ -359,30 +387,32 @@ function Install-WinGet {
         return $false
     }
 
-    # Paso 2: Limpiar instalaciones previas
-    Write-Step 2 5 "Limpiando instalaciones previas..."
-    Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
-    Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Remove-AppxPackage -ErrorAction SilentlyContinue
-
-    if (Test-Path 'C:\WinGet') {
-        Remove-Item 'C:\WinGet' -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not (Get-Command Add-AppxPackage -ErrorAction SilentlyContinue) -or
+        -not (Get-Command Add-AppxProvisionedPackage -ErrorAction SilentlyContinue)) {
+        Write-ErrMsg 'Este sistema no incluye los cmdlets AppX necesarios. WinGet requiere Windows 10/11 o Windows Server 2019 LTSC o posterior con Desktop Experience.'
+        return $false
     }
 
-    # Paso 3: Descargar componentes
-    Write-Step 3 5 "Descargando componentes de WinGet..."
-    $tempFolder = Join-Path $env:TEMP 'WinGetInstall'
+    # No se desinstala App Installer: en LTSC/Server puede estar aprovisionado para otros usuarios.
+    Write-Step 2 5 "Preparando instalacion sin Microsoft Store..."
+    $tempFolder = Join-Path $env:TEMP ("WinGetInstall-" + [guid]::NewGuid().ToString())
     New-Item -ItemType Directory -Path $tempFolder -Force | Out-Null
 
     try {
+        # Paso 3: Descargar componentes
+        Write-Step 3 5 "Descargando WinGet y sus dependencias..."
+        $arch = Get-OSArch
+        if ($arch -notin @('x64','x86','arm64')) { $arch = 'x64' }
+
         # VCLibs
         Write-Info "  Descargando VCLibs..."
         $vclibsPath = Join-Path $tempFolder 'VCLibs.appx'
-        Invoke-Download -Uri 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx' -OutFile $vclibsPath
+        Invoke-Download -Uri "https://aka.ms/Microsoft.VCLibs.$arch.14.00.Desktop.appx" -OutFile $vclibsPath
 
-        # UI.Xaml
+        # UI.Xaml 2.8 es dependencia de App Installer en LTSC/IoT sin Microsoft Store.
         Write-Info "  Descargando UI.Xaml..."
         $uixamlPath = Join-Path $tempFolder 'UIXaml.appx'
-        Invoke-Download -Uri 'https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx' -OutFile $uixamlPath
+        Invoke-Download -Uri "https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.$arch.appx" -OutFile $uixamlPath
 
         # WinGet
         Write-Info "  Descargando WinGet..."
@@ -400,51 +430,32 @@ function Install-WinGet {
         Invoke-Download -Uri $wingetUrl -OutFile $wingetPath
         Invoke-Download -Uri $licenseUrl -OutFile $licensePath
 
-        # Paso 4: Instalar dependencias y WinGet
-        Write-Step 4 5 "Instalando paquetes AppX..."
+        # Paso 4: Instalar y aprovisionar las dependencias para el usuario actual y futuros usuarios.
+        Write-Step 4 5 "Instalando paquetes AppX para LTSC/Server..."
 
-        try {
-            Write-Info "  Instalando VCLibs..."
-            Add-AppxPackage -Path $vclibsPath -ErrorAction Stop
-        } catch {
-            throw "Fallo la instalacion de VCLibs: $($_.Exception.Message)"
+        # Una dependencia ya instalada puede devolver un error; se conserva y se valida al instalar App Installer.
+        foreach ($dependency in @($vclibsPath, $uixamlPath)) {
+            try {
+                Write-Info "  Instalando $(Split-Path $dependency -Leaf)..."
+                Add-AppxPackage -Path $dependency -ErrorAction Stop
+            } catch { Write-WarnMsg "No fue necesario reinstalar $(Split-Path $dependency -Leaf): $($_.Exception.Message)" }
+
+            # El aprovisionamiento permite que el paquete esté disponible para nuevos perfiles y SYSTEM.
+            try { Add-AppxProvisionedPackage -Online -PackagePath $dependency -SkipLicense -ErrorAction Stop | Out-Null }
+            catch { Write-WarnMsg "No se pudo aprovisionar $(Split-Path $dependency -Leaf): $($_.Exception.Message)" }
         }
 
-        try {
-            Write-Info "  Instalando UI.Xaml..."
-            Add-AppxPackage -Path $uixamlPath -ErrorAction Stop
-        } catch {
-            throw "Fallo la instalacion de UI.Xaml: $($_.Exception.Message)"
-        }
-        
         try {
             Write-Info "  Instalando WinGet..."
-            Add-AppxProvisionedPackage -Online -PackagePath $wingetPath -LicensePath $licensePath -ErrorAction Stop | Out-Null
             Add-AppxPackage -Path $wingetPath -ErrorAction Stop
+            Add-AppxProvisionedPackage -Online -PackagePath $wingetPath -LicensePath $licensePath -ErrorAction Stop | Out-Null
         } catch {
             throw "Fallo la instalacion de WinGet: $($_.Exception.Message)"
         }
 
-        # Paso 5: Configurar acceso permanente
-        Write-Step 5 5 "Configurando acceso permanente..."
+        # Paso 5: Resolver el binario incluso cuando no exista el alias winget de WindowsApps.
+        Write-Step 5 5 "Verificando acceso a WinGet..."
         Start-Sleep -Seconds 3
-
-        $wingetPackage = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue
-        if ($wingetPackage) {
-            $wingetSource = $wingetPackage.InstallLocation
-            $wingetDest = 'C:\WinGet'
-
-            New-Item -ItemType Directory -Path $wingetDest -Force | Out-Null
-            Copy-Item -Path "$wingetSource\*" -Destination $wingetDest -Recurse -Force -ErrorAction SilentlyContinue
-
-            $currentPath = [Environment]::GetEnvironmentVariable('Path', [EnvironmentVariableTarget]::Machine)
-            if ($currentPath -notlike "*$wingetDest*") {
-                [Environment]::SetEnvironmentVariable('Path', "$currentPath;$wingetDest", [EnvironmentVariableTarget]::Machine)
-                $env:Path = "$env:Path;$wingetDest"
-                Write-Info "WinGet agregado al PATH de la maquina. Se requiere reiniciar la sesion de PowerShell."
-            }
-            icacls $wingetDest /grant 'Users:(OI)(CI)RX' /T 2>$null | Out-Null
-        }
 
         Start-Sleep -Seconds 2
         if (Test-WinGetInstalled) {
@@ -525,8 +536,8 @@ function Update-RuckZuckApps {
 #region WinGet Updates
 function Ensure-WinGetSources {
     try {
-        winget source update --disable-interactivity 2>$null | Out-Null
-        winget source reset --disable-interactivity 2>$null | Out-Null
+        Invoke-WinGet source update --disable-interactivity 2>$null | Out-Null
+        Invoke-WinGet source reset --disable-interactivity 2>$null | Out-Null
     } catch { }
 }
 
@@ -551,7 +562,7 @@ function Update-WinGetApps {
 
     try {
         Write-Info "Buscando actualizaciones..."
-        $upgrades = winget upgrade --accept-source-agreements --include-unknown --disable-interactivity 2>$null
+        $upgrades = Invoke-WinGet upgrade --accept-source-agreements --include-unknown --disable-interactivity 2>$null
 
         if ($upgrades -match 'No installed package found matching') {
             Write-Ok "No hay actualizaciones WinGet disponibles."
@@ -559,7 +570,7 @@ function Update-WinGetApps {
         }
 
         Write-Info "Ejecutando 'winget upgrade --all'..."
-        winget upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+        Invoke-WinGet upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
         Write-Ok "Actualizacion WinGet completada."
     } catch {
         Write-ErrMsg "Error en WinGet: $($_.Exception.Message)"
@@ -601,7 +612,7 @@ function Update-MicrosoftStore {
         if (Test-WinGetInstalled) {
             Ensure-WinGetSources
             Write-Info "Actualizando apps Store via WinGet..."
-            winget upgrade --source msstore --all --include-unknown --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+            Invoke-WinGet upgrade --source msstore --all --include-unknown --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
         }
         Write-Ok "Proceso Microsoft Store finalizado."
     } catch {
@@ -722,7 +733,7 @@ Write-Ok "========================================"
 try { Stop-Transcript | Out-Null } catch {}
 #endregion
 
-# SIG # Begin signature block
+# Firma anterior eliminada: el contenido cambió después de la firma original.
 # MIIcCwYJKoZIhvcNAQcCoIIb/DCCG/gCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
 # KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA2VbSCHhYjxsQU
@@ -873,4 +884,4 @@ try { Stop-Transcript | Out-Null } catch {}
 # k2Web2QLhzxP1Oxdi7gRWQeAxPEZWc3I6pyRIT9QAHBi9mQD6yoCZMclRjqE1CQW
 # iYTMw7jXbG7fy22al6ZgBuaqEqqu7bGvKueX0NkXqizVyM5B1Njl3fSkpVfGtAvV
 # qO6VovANR0W8Q8HXxkDhEPXqPrZPIsAFguSs+Djk2Q==
-# SIG # End signature block
+# Fin de la firma anterior eliminada.
