@@ -292,21 +292,33 @@ function Ensure-WinGetSources {
 }
 
 function Get-WinGetUpgradesList {
-    param([switch]$AsTextFallback)
-    try {
-        $json = winget upgrade --accept-source-agreements --include-unknown --output json --disable-interactivity 2>$null
-        if ([string]::IsNullOrWhiteSpace($json)) { throw "Salida JSON vacía" }
-        $data = $json | ConvertFrom-Json -ErrorAction Stop
-        if ($data.PSObject.Properties.Name -contains 'Upgrades') { return $data.Upgrades }
-        elseif ($data -is [System.Collections.IEnumerable]) { return $data }
-        else { return @() }
-    } catch {
-        if ($AsTextFallback) {
-            $text = winget upgrade --accept-source-agreements --include-unknown --disable-interactivity | Out-String
-            $lines = $text -split "`n" | Where-Object { $_ -match '^\S' }
-            return $lines
-        } else { throw }
+    $text = winget upgrade --accept-source-agreements --include-unknown --disable-interactivity | Out-String
+    $lines = $text -split "`n" | Where-Object { $_ -match '^\S' }
+    return $lines
+}
+
+# Extrae los Id de paquete de la salida de 'winget upgrade' (columnas separadas por 2+ espacios)
+function Get-WinGetUpgradeIds {
+    # Se parsea por POSICIÓN de columna (según la cabecera): cuando el nombre llena su columna
+    # solo queda 1 espacio antes del Id y separar por 2+ espacios devolvía la versión como Id.
+    $lines = Get-WinGetUpgradesList
+    $idStart = -1; $verStart = -1
+    $ids = foreach ($raw in $lines) {
+        $line = $raw.TrimEnd()
+        if ($line -match '^Name\s+Id\s+Version') {                      # cabecera (se repite en la 2ª tabla)
+            $idStart  = $line.IndexOf('Id')
+            $verStart = $line.IndexOf('Version')
+            continue
+        }
+        if ($idStart -lt 0) { continue }
+        if ($line -match '^-+$') { continue }                           # separador
+        if ($line -match '\d+\s+upgrades?\s+available') { continue }    # resumen
+        if ($line -match '^(No\s|The following)') { continue }
+        if ($line.Length -le $idStart) { continue }
+        $end = if ($verStart -gt $idStart -and $line.Length -ge $verStart) { $verStart - $idStart } else { $line.Length - $idStart }
+        $line.Substring($idStart, $end).Trim()
     }
+    return @($ids | Where-Object { $_ -match '^[\w\.\-]+$' } | Select-Object -Unique)
 }
 
 function Update-WinGetApps {
@@ -324,18 +336,50 @@ function Update-WinGetApps {
 
     Ensure-WinGetSources
     try {
-        $upgrades = Get-WinGetUpgradesList -AsTextFallback
+        $upgrades = Get-WinGetUpgradesList
         if (-not $upgrades -or $upgrades.Count -eq 0) { Write-Ok "✅ No hay actualizaciones WinGet disponibles."; return }
 
         Write-WarnMsg "✨ Aplicaciones con actualización (WinGet):"
-        if ($upgrades -and $upgrades[0].PSObject.Properties.Name -contains 'Package') {
-            $upgrades | ForEach-Object { Write-Host (" - " + (${_}.Package.Name ?? ${_}.PackageIdentifier)) -ForegroundColor White }
-        } else {
-            $upgrades | ForEach-Object { Write-Host (" - " + $_) -ForegroundColor White }
+        $upgrades | ForEach-Object { Write-Host (" - " + $_) -ForegroundColor White }
+
+        $ids = Get-WinGetUpgradeIds
+        if (-not $ids -or $ids.Count -eq 0) {
+            Write-WarnMsg "⚠️ No se pudieron extraer los Id de paquete; reintento con 'winget upgrade --all'..."
+            winget upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+            Write-Ok "✅ Actualización WinGet completada."
+            return
         }
 
-        Write-Info "🔄 'winget upgrade --all' (incluye pinned y versiones desconocidas)..."
-        winget upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+        # Se actualiza paquete por paquete: si uno falla (p. ej. requiere --location),
+        # 'winget upgrade --all' aborta todo el lote restante. Uno por uno, un fallo no bloquea al resto.
+        foreach ($id in $ids) {
+            Write-Info "🔄 Actualizando $id..."
+            winget upgrade --id $id --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+            if ($LASTEXITCODE -eq 0) {
+                Write-Ok "✅ $id actualizado."
+            } elseif ($LASTEXITCODE -eq -1978335090) {
+                Write-WarnMsg "⚠️ ${id}: tecnología de instalación distinta; se aplica desinstalar + reinstalar automáticamente."
+                if ($id -eq 'Microsoft.Edge') {
+                    # Edge no se desinstala: se fuerza su actualizador propio.
+                    $eu = @("${env:ProgramFiles(x86)}\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe","$env:ProgramFiles\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+                    if ($eu) {
+                        Start-Process -FilePath $eu -ArgumentList '/ua /installsource scheduler' -Wait -NoNewWindow
+                        Write-Ok "✅ Edge: se lanzó su actualizador integrado."
+                    } else { Write-WarnMsg "⚠️ No se encontró MicrosoftEdgeUpdate.exe." }
+                } else {
+                    winget uninstall --id $id --silent --disable-interactivity
+                    if ($LASTEXITCODE -eq 0) {
+                        winget install --id $id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+                        if ($LASTEXITCODE -eq 0) { Write-Ok "✅ $id reinstalado en la versión nueva." }
+                        else { Write-WarnMsg "⚠️ $id se desinstaló pero la reinstalación falló (código $LASTEXITCODE). Reinstálalo manualmente." }
+                    } else {
+                        Write-WarnMsg "⚠️ No se pudo desinstalar $id (código $LASTEXITCODE). Continúo."
+                    }
+                }
+            } else {
+                Write-WarnMsg "⚠️ $id no se pudo actualizar (código $LASTEXITCODE). Continúo con el resto."
+            }
+        }
         Write-Ok "✅ Actualización WinGet completada."
     } catch {
         Write-ErrMsg "❌ Error en WinGet: $($_.Exception.Message)"
