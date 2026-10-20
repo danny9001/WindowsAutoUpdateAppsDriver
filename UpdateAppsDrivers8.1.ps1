@@ -522,9 +522,10 @@ function Get-WinGetUpgradesList {
 
 # Extrae los Id de paquete de la salida de 'winget upgrade' (columnas separadas por 2+ espacios)
 function Get-WinGetUpgradeIds {
+    param([string[]]$Lines)
     # Se parsea por POSICIÓN de columna (según la cabecera): cuando el nombre llena su columna
     # solo queda 1 espacio antes del Id y separar por 2+ espacios devolvía la versión como Id.
-    $lines = Get-WinGetUpgradesList
+    if (-not $PSBoundParameters.ContainsKey('Lines')) { $Lines = Get-WinGetUpgradesList }
     $idStart = -1; $verStart = -1
     $ids = foreach ($raw in $lines) {
         $line = $raw.TrimEnd()
@@ -541,7 +542,7 @@ function Get-WinGetUpgradeIds {
         $end = if ($verStart -gt $idStart -and $line.Length -ge $verStart) { $verStart - $idStart } else { $line.Length - $idStart }
         $line.Substring($idStart, $end).Trim()
     }
-    return @($ids | Where-Object { $_ -match '^[\w\.\-]+$' } | Select-Object -Unique)
+    return @($ids | Where-Object { $_ -match '^[\w\.\+\-]+$' } | Select-Object -Unique)
 }
 
 function Update-WinGetApps {
@@ -573,7 +574,7 @@ function Update-WinGetApps {
         Write-WarnMsg "✨ Aplicaciones con actualización (WinGet):"
         $upgrades | ForEach-Object { Write-Host (" - " + $_) -ForegroundColor White }
 
-        $ids = Get-WinGetUpgradeIds
+        $ids = Get-WinGetUpgradeIds -Lines $upgrades
         if (-not $ids -or $ids.Count -eq 0) {
             Write-WarnMsg "⚠️ No se pudieron extraer los Id de paquete; reintento con 'winget upgrade --all'..."
             Invoke-WinGet upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
@@ -584,6 +585,7 @@ function Update-WinGetApps {
         # Se actualiza paquete por paquete: si uno falla (p. ej. requiere --location),
         # 'winget upgrade --all' aborta todo el lote restante. Uno por uno, un fallo no bloquea al resto.
         foreach ($id in $ids) {
+            try {
             Write-Info "🔄 Actualizando $id..."
             Invoke-WinGet upgrade --id $id --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
             if ($LASTEXITCODE -eq 0) {
@@ -609,6 +611,9 @@ function Update-WinGetApps {
                 }
             } else {
                 Write-WarnMsg "⚠️ $id no se pudo actualizar (código $LASTEXITCODE). Continúo con el resto."
+            }
+            } catch {
+                Write-WarnMsg "⚠️ Error procesando ${id}: $($_.Exception.Message). Continúo con el resto."
             }
         }
         Write-Ok "✅ Actualización WinGet completada."

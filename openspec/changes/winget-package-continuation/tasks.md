@@ -1,0 +1,4 @@
+- [x] Documentar defecto y criterios antes de editar codigo.
+- [x] Corregir parser y aislar errores individuales.
+- [x] Probar extraccion y continuidad con codigo de error y excepcion (tests/WinGetContinuation.Tests.ps1); tambien paso la regresion de tareas programadas.
+- [x] Preparar publicacion y sincronizacion de script local.
