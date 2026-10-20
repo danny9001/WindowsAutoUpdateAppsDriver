@@ -310,8 +310,11 @@ function Invoke-WindowsPowerShellCommand {
     $windowsPowerShell = Get-WindowsPowerShellPath
     if (-not $windowsPowerShell) { throw 'Windows PowerShell 5.1 no esta disponible.' }
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
-    & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedCommand
-    if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell devolvio el codigo $LASTEXITCODE." }
+    $output = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedCommand 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $details = ($output | Out-String).Trim()
+        throw "Windows PowerShell devolvio el codigo $LASTEXITCODE. $details"
+    }
 }
 
 function Get-WinGetExecutable {
@@ -394,6 +397,19 @@ function Install-VCRedist {
     }
 }
 
+function Enable-AppSideloading {
+    try {
+        $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx'
+        New-Item -Path $policyPath -Force | Out-Null
+        Set-ItemProperty -Path $policyPath -Name AllowAllTrustedApps -Type DWord -Value 1 -Force
+        Write-Info 'Se habilito la instalacion de aplicaciones de confianza para AppX/MSIX.'
+        return $true
+    } catch {
+        Write-WarnMsg "No se pudo habilitar sideloading AppX: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Install-WinGet {
     if (-not (Test-IsAdmin)) { Write-ErrMsg 'Se requiere Admin para instalar WinGet.'; return $false }
     if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg 'Sin Internet para instalar WinGet.'; return $false }
@@ -407,6 +423,7 @@ function Install-WinGet {
         return $false
     }
 
+    Enable-AppSideloading | Out-Null
     $architecture = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64') { $architecture = 'arm64' }
     $tempFolder = Join-Path $env:TEMP ("WinGetInstall-" + [guid]::NewGuid().ToString())
