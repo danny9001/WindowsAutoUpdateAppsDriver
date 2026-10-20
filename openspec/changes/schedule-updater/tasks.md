@@ -1,0 +1,6 @@
+- [x] Documentar propuesta y diseno antes del codigo.
+- [x] Implementar menu y tarea semanal.
+- [x] Evitar preguntas en ejecucion programada y preservar opciones al relanzar.
+- [x] Validar sintaxis y probar con cmdlets simulados (tests/ScheduledTask.Tests.ps1).
+- [x] Preparar publicacion del cambio y sincronizacion de copia local.
+- [ ] Vincular y archivar en MemAI cuando este disponible (limitacion de herramientas de la sesion).

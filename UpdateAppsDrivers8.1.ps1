@@ -14,6 +14,9 @@
 .PARAMETER ForceWinGetReinstall
   Reinstalar WinGet aunque ya este disponible.
 
+.PARAMETER ScheduledRun
+  Uso interno de la tarea programada: omite preguntas e instala WinGet si falta.
+
 .PARAMETER OutputFolder
   Carpeta para descargas y logs (por defecto, carpeta del script).
 
@@ -27,12 +30,14 @@ param(
     [switch]$NoRelaunch,
     [switch]$SkipStore,
     [switch]$ForceWinGetReinstall,
+    [switch]$ScheduledRun,
     [string]$OutputFolder = $(if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path })
 )
 
 # -------------------------
 # Utilidades base y logging
 # -------------------------
+$script:UpdaterScriptPath = $PSCommandPath
 function Write-Info($msg)    { Write-Host $msg -ForegroundColor Cyan }
 function Write-Ok($msg)      { Write-Host $msg -ForegroundColor Green }
 function Write-WarnMsg($msg) { Write-Host $msg -ForegroundColor Yellow }
@@ -140,12 +145,13 @@ function Ensure-PowerShell7 {
         Write-Info "🔁 Reejecutando este script en PowerShell 7..."
         $argsToPass = @()
         if ($PSBoundParameters.ContainsKey('NoRelaunch') -and $NoRelaunch) { $argsToPass += '-NoRelaunch' }
-        if ($PSBoundParameters.ContainsKey('SkipStore') -and $SkipStore) { $argsToPass += '-SkipStore' }
-        if ($PSBoundParameters.ContainsKey('ForceWinGetReinstall') -and $ForceWinGetReinstall) { $argsToPass += '-ForceWinGetReinstall' }
+        if ($SkipStore) { $argsToPass += '-SkipStore' }
+        if ($ForceWinGetReinstall) { $argsToPass += '-ForceWinGetReinstall' }
+        if ($ScheduledRun) { $argsToPass += '-ScheduledRun' }
         $argsToPass += @('-OutputFolder',"`"$OutputFolder`"")
 
         if ($PSCommandPath) {
-            Start-Process -FilePath $pwshCmd -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $argsToPass -Wait
+            Start-Process -FilePath $pwshCmd -ArgumentList (@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $argsToPass) -Wait
         } else {
             Start-Process -FilePath $pwshCmd -ArgumentList @('-NoLogo','-NoProfile') -Wait
         }
@@ -364,6 +370,7 @@ function Test-WinGetInstalled {
 }
 
 function Confirm-WinGetInstallation {
+    if ($ScheduledRun) { return $true }
     if (-not [Environment]::UserInteractive) {
         Write-WarnMsg 'WinGet no esta instalado y esta ejecucion no tiene interfaz para solicitar confirmacion.'
         return $false
@@ -706,6 +713,55 @@ function Get-PendingReboot {
     return $false
 }
 
+function Read-UpdaterYesNo {
+    param([string]$Prompt)
+    do { $answer = (Read-Host "$Prompt [S/N]").Trim() } while ($answer -notmatch '^(s|si|n|no)$')
+    return ($answer -match '^(s|si)$')
+}
+
+function Configure-UpdaterScheduledTask {
+    if ($ScheduledRun -or -not [Environment]::UserInteractive) { return }
+    if (-not (Read-UpdaterYesNo 'Desea crear una tarea automatica semanal para este script?')) { return }
+    if (-not (Test-IsAdmin)) {
+        Write-WarnMsg 'Ejecute como Administrador para crear la tarea programada.'
+        return
+    }
+    try {
+        $scriptPath = $script:UpdaterScriptPath
+        if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath)) { throw 'Se requiere ejecutar el script desde un archivo guardado.' }
+        $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+        if (-not (Test-Path -LiteralPath $pwshPath)) {
+            $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+            if (-not $command) { throw 'PowerShell 7 debe estar instalado antes de programar la tarea.' }
+            $pwshPath = $command.Source
+        }
+        $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
+        try { $pathHash = [BitConverter]::ToString($hashAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($scriptPath.ToLowerInvariant()))).Replace('-', '').Substring(0, 12) }
+        finally { $hashAlgorithm.Dispose() }
+        $taskName = "UpdateAppsDrivers8.1-$pathHash"
+        $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($existing -and -not (Read-UpdaterYesNo "La tarea $taskName ya existe. Desea reemplazar su horario?")) { return }
+
+        Write-Info 'Dia semanal: 1=Lunes, 2=Martes, 3=Miercoles, 4=Jueves, 5=Viernes, 6=Sabado, 7=Domingo.'
+        do { $day = (Read-Host 'Seleccione el dia (1-7)').Trim() } while ($day -notmatch '^[1-7]$')
+        do { $time = (Read-Host 'Hora local del equipo en formato HH:mm (ejemplo 22:30)').Trim() } while ($time -notmatch '^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        $days = @('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
+        $dayNames = @('Lunes','Martes','Miercoles','Jueves','Viernes','Sabado','Domingo')
+        $at = [datetime]::Today.Add([TimeSpan]::ParseExact($time, 'hh\:mm', [Globalization.CultureInfo]::InvariantCulture))
+        Write-Info "La tarea se ejecutara como SYSTEM cada $($dayNames[[int]$day - 1]) a las $time, con instalacion automatica de WinGet si falta."
+        $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScheduledRun -OutputFolder "{1}"' -f $scriptPath, $OutputFolder.TrimEnd('\')
+        if ($SkipStore) { $arguments += ' -SkipStore' }
+        $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $arguments -WorkingDirectory (Split-Path -Parent $scriptPath) -ErrorAction Stop
+        $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $days[[int]$day - 1] -At $at -ErrorAction Stop
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest -ErrorAction Stop
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ErrorAction Stop
+        $registration = @{ TaskName=$taskName; Action=$action; Trigger=$trigger; Principal=$principal; Settings=$settings; Description="Actualizaciones semanales de aplicaciones y drivers: $scriptPath"; ErrorAction='Stop' }
+        if ($existing) { $registration.Force = $true }
+        Register-ScheduledTask @registration | Out-Null
+        Write-Ok "Tarea $taskName creada: $($dayNames[[int]$day - 1]) a las $time (horario local). Conserve el script en $scriptPath."
+    } catch { Write-ErrMsg "No se pudo crear la tarea programada: $($_.Exception.Message)" }
+}
+
 # -------------------------
 # MAIN
 # -------------------------
@@ -736,6 +792,7 @@ if (-not (Test-IsAdmin)) {
 }
 
 # Flujo de actualización
+Configure-UpdaterScheduledTask
 Update-RuckZuckApps
 Update-WinGetApps
 Update-MicrosoftStore
