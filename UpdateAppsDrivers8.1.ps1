@@ -8,10 +8,6 @@
 .PARAMETER NoRelaunch
   No relanzar en pwsh aunque PS sea < 7.
 
-.PARAMETER AutoInstallPwsh
-  Compatibilidad con versiones previas. Si se ejecuta con PowerShell 5.1, PowerShell 7 se instala automaticamente
-  y el script se relanza, salvo que se indique -NoRelaunch.
-
 .PARAMETER SkipStore
   Omitir pasos de Microsoft Store incluso en equipos cliente.
 
@@ -29,7 +25,6 @@
 [CmdletBinding()]
 param(
     [switch]$NoRelaunch,
-    [switch]$AutoInstallPwsh,
     [switch]$SkipStore,
     [switch]$ForceWinGetReinstall,
     [string]$OutputFolder = $(if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path })
@@ -145,7 +140,6 @@ function Ensure-PowerShell7 {
         Write-Info "🔁 Reejecutando este script en PowerShell 7..."
         $argsToPass = @()
         if ($PSBoundParameters.ContainsKey('NoRelaunch') -and $NoRelaunch) { $argsToPass += '-NoRelaunch' }
-        if ($PSBoundParameters.ContainsKey('AutoInstallPwsh') -and $AutoInstallPwsh) { $argsToPass += '-AutoInstallPwsh' }
         if ($PSBoundParameters.ContainsKey('SkipStore') -and $SkipStore) { $argsToPass += '-SkipStore' }
         if ($PSBoundParameters.ContainsKey('ForceWinGetReinstall') -and $ForceWinGetReinstall) { $argsToPass += '-ForceWinGetReinstall' }
         $argsToPass += @('-OutputFolder',"`"$OutputFolder`"")
