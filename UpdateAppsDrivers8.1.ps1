@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Actualiza apps (RuckZuck, WinGet, Microsoft Store) y Windows/Drivers.
@@ -17,6 +17,33 @@
 .PARAMETER ScheduledRun
   Uso interno de la tarea programada: omite preguntas e instala WinGet si falta.
 
+.PARAMETER SkipScheduleTask
+  No preguntar por la tarea programada.
+
+.PARAMETER ReconfigureTask
+  Permite cambiar el horario aunque la tarea ya exista (por defecto, si existe no se pregunta).
+
+.PARAMETER IncludePinned
+  Actualizar tambien paquetes WinGet anclados (pin). Por defecto se respetan.
+
+.PARAMETER IncludeUnknown
+  Incluir paquetes WinGet con version desconocida. Por defecto se omiten.
+
+.PARAMETER AllowReinstall
+  Permitir desinstalar + reinstalar cuando WinGet indica otra tecnologia de instalacion. Por defecto no.
+
+.PARAMETER ExcludeIds
+  Ids de WinGet a omitir (lista separada por comas). Tambien se lee 'exclusiones.txt' (un Id por linea) junto al script.
+
+.PARAMETER RebootPolicy
+  None (solo avisa) o IfPending (reinicia a los 60 s si queda reinicio pendiente).
+
+.PARAMETER DryRun
+  Solo lista lo pendiente (RZGet, WinGet, Windows Update); no instala ni cambia nada.
+
+.PARAMETER LogRetentionDays
+  Dias que se conservan los logs Actualizar-*.log (por defecto 30).
+
 .PARAMETER OutputFolder
   Carpeta para descargas y logs (por defecto, carpeta del script).
 
@@ -31,8 +58,24 @@ param(
     [switch]$SkipStore,
     [switch]$ForceWinGetReinstall,
     [switch]$ScheduledRun,
+    [switch]$SkipScheduleTask,
+    [switch]$ReconfigureTask,
+    [switch]$IncludePinned,
+    [switch]$IncludeUnknown,
+    [switch]$AllowReinstall,
+    [switch]$DryRun,
+    [string[]]$ExcludeIds = @(),
+    [ValidateSet('None','IfPending')][string]$RebootPolicy = 'None',
+    [int]$LogRetentionDays = 30,
     [string]$OutputFolder = $(if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path })
 )
+
+# Permite -ExcludeIds "a,b" (al pasar por -File llega como una sola cadena)
+$ExcludeIds = @($ExcludeIds | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$script:Failures = [Collections.Generic.List[string]]::new()
+$script:Successes = [Collections.Generic.List[string]]::new()
+$script:Skipped = [Collections.Generic.List[string]]::new()
+$script:InternetCheckedAt = $null
 
 # -------------------------
 # Utilidades base y logging
@@ -42,13 +85,34 @@ function Write-Info($msg)    { Write-Host $msg -ForegroundColor Cyan }
 function Write-Ok($msg)      { Write-Host $msg -ForegroundColor Green }
 function Write-WarnMsg($msg) { Write-Host $msg -ForegroundColor Yellow }
 function Write-ErrMsg($msg)  { Write-Host $msg -ForegroundColor Red }
+function Write-Detail($msg)  { Write-Host "    $msg" -ForegroundColor DarkGray }
+function Write-Section {
+    param([int]$Number, [int]$Total, [string]$Title)
+    $text = " [$Number/$Total] $Title "
+    Write-Host ''
+    Write-Host ('═' * 70) -ForegroundColor DarkCyan
+    Write-Host $text -ForegroundColor Cyan
+    Write-Host ('═' * 70) -ForegroundColor DarkCyan
+}
+
+# Salida UTF-8 para leer bien la salida de winget (evita caracteres como "┬«")
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
 
 # Asegurar carpeta de trabajo
 if (-not (Test-Path $OutputFolder)) {
     New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
 }
 # Transcript
-$tsFile = Join-Path $OutputFolder ("Actualizar-{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+$LogFolder = Join-Path $OutputFolder 'Logs'
+if (-not (Test-Path $LogFolder)) {
+    New-Item -Path $LogFolder -ItemType Directory -Force | Out-Null
+}
+if ($LogRetentionDays -gt 0) {
+    Get-ChildItem -LiteralPath $LogFolder -Filter 'Actualizar-*.log' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$LogRetentionDays) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+$tsFile = Join-Path $LogFolder ("Actualizar-{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
 try { Start-Transcript -Path $tsFile -ErrorAction SilentlyContinue | Out-Null } catch {}
 
 # TLS 1.2 en Windows PowerShell 5.1
@@ -68,6 +132,28 @@ function Set-ProxyDefaults {
     } catch { }
 }
 
+# Verifica la firma Authenticode de un archivo descargado.
+# -Publisher: fragmento esperado del sujeto del certificado. -WarnOnly: solo avisa si falla.
+function Test-DownloadSignature {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [string]$Publisher,
+        [switch]$WarnOnly
+    )
+    $ok = $false; $detail = ''
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ($sig.Status -ne 'Valid') { $detail = "firma $($sig.Status)" }
+        elseif ($Publisher -and $sig.SignerCertificate.Subject -notmatch [regex]::Escape($Publisher)) { $detail = "editor inesperado: $($sig.SignerCertificate.Subject)" }
+        else { $ok = $true }
+    } catch { $detail = $_.Exception.Message }
+    if (-not $ok) {
+        $msg = "Verificacion de firma de $(Split-Path $Path -Leaf): $detail"
+        if ($WarnOnly) { Write-WarnMsg "⚠️ $msg" } else { Write-ErrMsg "❌ $msg" }
+    }
+    return ($ok -or $WarnOnly)
+}
+
 # Admin
 function Test-IsAdmin {
     $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -81,6 +167,8 @@ function Test-Internet {
         [int]$TimeoutMs = 5000,
         [switch]$VerboseMode
     )
+    # Cache: si hubo Internet hace menos de 2 minutos, no repetir las sondas.
+    if ($script:InternetCheckedAt -and ((Get-Date) - $script:InternetCheckedAt).TotalSeconds -lt 120) { return $true }
     Set-Tls12Enable
     Set-ProxyDefaults
 
@@ -102,9 +190,9 @@ function Test-Internet {
             if ($PSVersionTable.PSVersion.Major -lt 7) { $params.UseBasicParsing = $true }
             $resp = Invoke-WebRequest @params
             if ($p.Expect) {
-                if ($resp.Content -match [regex]::Escape($p.Expect)) { return $true }
+                if ($resp.Content -match [regex]::Escape($p.Expect)) { $script:InternetCheckedAt = Get-Date; return $true }
             } else {
-                if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) { return $true }
+                if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) { $script:InternetCheckedAt = Get-Date; return $true }
             }
         } catch {
             if ($VerboseMode) {
@@ -117,7 +205,7 @@ function Test-Internet {
     try {
         $client = New-Object System.Net.Sockets.TcpClient
         $iar = $client.BeginConnect('www.microsoft.com', 443, $null, $null)
-        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.EndConnect($iar); $client.Close(); return $true }
+        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.EndConnect($iar); $client.Close(); $script:InternetCheckedAt = Get-Date; return $true }
         $client.Close()
     } catch {
         if ($VerboseMode) {
@@ -148,10 +236,21 @@ function Ensure-PowerShell7 {
         if ($SkipStore) { $argsToPass += '-SkipStore' }
         if ($ForceWinGetReinstall) { $argsToPass += '-ForceWinGetReinstall' }
         if ($ScheduledRun) { $argsToPass += '-ScheduledRun' }
+        if ($SkipScheduleTask) { $argsToPass += '-SkipScheduleTask' }
+        if ($ReconfigureTask) { $argsToPass += '-ReconfigureTask' }
+        if ($IncludePinned) { $argsToPass += '-IncludePinned' }
+        if ($IncludeUnknown) { $argsToPass += '-IncludeUnknown' }
+        if ($AllowReinstall) { $argsToPass += '-AllowReinstall' }
+        if ($DryRun) { $argsToPass += '-DryRun' }
+        if ($ExcludeIds.Count -gt 0) { $argsToPass += @('-ExcludeIds',"`"$($ExcludeIds -join ',')`"") }
+        $argsToPass += @('-RebootPolicy',$RebootPolicy,'-LogRetentionDays',"$LogRetentionDays")
         $argsToPass += @('-OutputFolder',"`"$OutputFolder`"")
 
+        # Cerrar el transcript de este proceso: el pwsh relanzado crea el suyo.
+        try { Stop-Transcript | Out-Null } catch {}
         if ($PSCommandPath) {
-            Start-Process -FilePath $pwshCmd -ArgumentList (@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $argsToPass) -Wait
+            $p = Start-Process -FilePath $pwshCmd -ArgumentList (@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $argsToPass) -Wait -PassThru
+            exit $p.ExitCode
         } else {
             Start-Process -FilePath $pwshCmd -ArgumentList @('-NoLogo','-NoProfile') -Wait
         }
@@ -206,6 +305,10 @@ function Install-PowerShell7 {
         $iwr = @{ Uri = $asset.browser_download_url; OutFile = $msiPath; ErrorAction = 'Stop' }
         if ($PSVersionTable.PSVersion.Major -lt 7) { $iwr.UseBasicParsing = $true }
         Invoke-WebRequest @iwr
+        if (-not (Test-DownloadSignature -Path $msiPath -Publisher 'Microsoft')) {
+            Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+            throw 'El MSI descargado no tiene una firma valida de Microsoft.'
+        }
         Write-Info "⚙️ Instalando PowerShell 7 (silencioso)..."
         Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait
         Start-Sleep -Seconds 3
@@ -243,45 +346,83 @@ $Global:RZGetLatestUrl = 'https://github.com/rzander/ruckzuck/releases/latest/do
 function Download-RZGet {
     param([string]$DestinationFolder = $OutputFolder)
     $dest = Join-Path $DestinationFolder 'RZGet.exe'
-    if (Test-Path $dest) { return $dest }
+    # Reutilizar si tiene menos de 7 dias; si no, intentar refrescar (y conservar el anterior si falla).
+    if ((Test-Path $dest) -and ((Get-Item $dest).LastWriteTime -gt (Get-Date).AddDays(-7))) { return $dest }
     Write-Info "📥 Descargando RZGet.exe (RuckZuck)..."
     Set-Tls12Enable; Set-ProxyDefaults
-    $iwrParams = @{ Uri = $Global:RZGetLatestUrl; OutFile = $dest; ErrorAction='Stop' }
-    if ($PSVersionTable.PSVersion.Major -lt 7) { $iwrParams.UseBasicParsing = $true }
-    Invoke-WebRequest @iwrParams
-    Write-Ok "✅ RZGet.exe descargado en: $dest"
+    $tmp = "$dest.download"
+    try {
+        $iwrParams = @{ Uri = $Global:RZGetLatestUrl; OutFile = $tmp; ErrorAction='Stop' }
+        if ($PSVersionTable.PSVersion.Major -lt 7) { $iwrParams.UseBasicParsing = $true }
+        Invoke-WebRequest @iwrParams
+        Test-DownloadSignature -Path $tmp -WarnOnly | Out-Null
+        Move-Item -LiteralPath $tmp -Destination $dest -Force
+        Write-Ok "✅ RZGet.exe descargado en: $dest"
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $dest)) { throw }
+        Write-WarnMsg "⚠️ No se pudo refrescar RZGet.exe; se usa la copia existente."
+    }
     return $dest
 }
 
 function Update-RuckZuckApps {
-    $rzPath = Download-RZGet
-    if (-not $rzPath) {
-        Write-ErrMsg "❌ No se pudo obtener RZGet.exe."
-        return
-    }
+    Write-Section 1 4 'Aplicaciones (RuckZuck)'
     if (-not (Test-Internet -VerboseMode)) {
         Write-ErrMsg "❌ Sin Internet. Omitiendo RZGet."
         return
     }
-    Write-Info "🔍 Consultando actualizaciones (RZGet)..."
-    try {
-        $updatesList = & $rzPath update --list --all --user 2>&1
-        if ($updatesList -match 'No updates available') {
-            Write-Ok "✅ No hay actualizaciones pendientes por RZGet."
-            return
+    try { $rzPath = Download-RZGet } catch { $rzPath = $null; Write-WarnMsg "Descarga RZGet: $($_.Exception.Message)" }
+    if (-not $rzPath) {
+        Write-ErrMsg "❌ No se pudo obtener RZGet.exe."
+        $script:Failures.Add('RZGet: no disponible')
+        return
+    }
+    # RZGet separa las apps por ámbito: instaladas para la máquina y para el usuario (--user).
+    # Bajo SYSTEM (tarea programada) '--user' apuntaria al perfil de SYSTEM, sin apps: solo se revisa la máquina.
+    $scopes = @(@{ Name = 'máquina'; Args = @() })
+    if (-not $ScheduledRun) { $scopes += @{ Name = 'usuario'; Args = @('--user') } }
+
+    foreach ($scope in $scopes) {
+        Write-Host ("  ▸ Ámbito: {0}" -f $scope.Name) -ForegroundColor Cyan
+        try {
+            $scopeArgs = @($scope.Args)
+            # 'update --list' devuelve un nombre corto (Shortname) por linea; vacio si no hay nada.
+            $pending = @(& $rzPath update --list --all @scopeArgs 2>&1 | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^\S+$' } | Select-Object -Unique)
+            if ($pending.Count -eq 0) {
+                Write-Ok "    ✅ Sin actualizaciones pendientes."
+                continue
+            }
+            Write-WarnMsg ("    📋 Actualizaciones disponibles: {0}" -f $pending.Count)
+            if ($DryRun) {
+                $pending | ForEach-Object { Write-Host "      • $_" -ForegroundColor White }
+                continue
+            }
+            $index = 0
+            foreach ($short in $pending) {
+                $index++
+                Write-Host ("    [{0}/{1}] {2} ... " -f $index, $pending.Count, $short) -NoNewline -ForegroundColor White
+                try {
+                    $rzOut = @(& $rzPath update $short --retry @scopeArgs 2>&1 | ForEach-Object { [string]$_ })
+                    $code = $LASTEXITCODE
+                    if ($code -eq 0) {
+                        Write-Ok 'OK'
+                        $script:Successes.Add("RuckZuck $short")
+                    } else {
+                        Write-Host "FALLO (código $code)" -ForegroundColor Red
+                        $rzOut | Where-Object { $_ -match '\S' } | Select-Object -Last 3 | ForEach-Object { Write-Detail $_.Trim() }
+                        $script:Failures.Add("RuckZuck ${short}: codigo $code")
+                    }
+                } catch {
+                    Write-Host 'ERROR' -ForegroundColor Red
+                    Write-Detail $_.Exception.Message
+                    $script:Failures.Add("RuckZuck ${short}: $($_.Exception.Message)")
+                }
+            }
+        } catch {
+            $script:Failures.Add("RZGet ($($scope.Name)): $($_.Exception.Message)")
+            Write-ErrMsg "    ❌ Error RZGet ($($scope.Name)): $($_.Exception.Message)"
         }
-        $updatesArray = $updatesList -split "`n" | Where-Object { $_ -match "^\s*\- " } | ForEach-Object { $_ -replace "^\s*\- ", "" }
-        if ($updatesArray.Count -gt 0) {
-            Write-WarnMsg "✨ Actualizaciones disponibles (RZGet):"
-            $updatesArray | ForEach-Object { Write-Host " - $_" -ForegroundColor White }
-            Write-Info "🔄 Iniciando actualización con RZGet..."
-            & $rzPath update --all --retry --user
-            Write-Ok "✅ Actualización RZGet completada."
-        } else {
-            Write-Ok "✅ Sin actualizaciones detectadas por RZGet."
-        }
-    } catch {
-        Write-ErrMsg "❌ Error RZGet: $($_.Exception.Message)"
     }
 }
 
@@ -392,6 +533,7 @@ function Install-VCRedist {
         $installer = Join-Path $tempFolder "vc_redist.$architecture.exe"
         Write-Info "Descargando Visual C++ Redistributable ($architecture)..."
         Invoke-Download "https://aka.ms/vs/17/release/vc_redist.$architecture.exe" $installer
+        if (-not (Test-DownloadSignature -Path $installer -Publisher 'Microsoft')) { throw 'vc_redist sin firma valida de Microsoft.' }
         $process = Start-Process -FilePath $installer -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
         if ($process.ExitCode -notin @(0, 3010)) { throw "El instalador VC++ devolvio el codigo $($process.ExitCode)." }
         Write-Ok 'Visual C++ Redistributable instalado.'
@@ -467,6 +609,7 @@ function Install-WinGet {
         if (-not $bundleUrl -or -not $licenseUrl) { throw 'No se encontraron los archivos de WinGet en la release actual.' }
         Invoke-Download $bundleUrl $bundlePath
         Invoke-Download $licenseUrl $licensePath
+        if (-not (Test-DownloadSignature -Path $bundlePath -Publisher 'Microsoft')) { throw 'El bundle de WinGet no tiene firma valida de Microsoft.' }
 
         # Usar las dependencias de la misma release: WinGet 1.29 requiere WindowsAppRuntime 1.8.
         $dependencyAsset = $release.assets | Where-Object { $_.name -eq 'DesktopAppInstaller_Dependencies.zip' } | Select-Object -First 1
@@ -506,32 +649,54 @@ function Install-WinGet {
 
 function Ensure-WinGetSources {
     try {
-        Write-Info "🔄 Actualizando/Restableciendo fuentes de WinGet..."
+        Write-Detail "Preparando fuentes de WinGet..."
         Invoke-WinGet source update --disable-interactivity | Out-Null
-        Invoke-WinGet source reset  --disable-interactivity | Out-Null  # restablece winget + msstore
+        Invoke-WinGet source reset --force --disable-interactivity | Out-Null  # restablece winget + msstore (requiere --force)
     } catch {
         Write-WarnMsg "⚠️ No se pudieron preparar las fuentes de WinGet: $($_.Exception.Message)"
     }
 }
 
+# Opciones opcionales de 'winget upgrade': por defecto se respetan pines y versiones desconocidas.
+function Get-WinGetUpgradeFlags {
+    $flags = @()
+    if ($IncludeUnknown) { $flags += '--include-unknown' }
+    if ($IncludePinned)  { $flags += '--include-pinned' }
+    return $flags
+}
+
+# Ids a omitir: -ExcludeIds + exclusiones.txt (junto al script).
+function Get-ExcludedIds {
+    $list = [Collections.Generic.List[string]]::new()
+    foreach ($e in $ExcludeIds) { $list.Add($e) }
+    $file = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'exclusiones.txt' } else { $null }
+    if ($file -and (Test-Path -LiteralPath $file)) {
+        Get-Content -LiteralPath $file -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^#' } | ForEach-Object { $list.Add($_) }
+    }
+    return @($list | Select-Object -Unique)
+}
+
 function Get-WinGetUpgradesList {
-    $text = Invoke-WinGet upgrade --accept-source-agreements --include-unknown --disable-interactivity | Out-String
+    $wgArgs = @('upgrade','--accept-source-agreements') + @(Get-WinGetUpgradeFlags) + @('--disable-interactivity')
+    $text = Invoke-WinGet @wgArgs | Out-String
     $lines = $text -split "`n" | Where-Object { $_ -match '^\S' }
     return $lines
 }
 
-# Extrae los Id de paquete de la salida de 'winget upgrade' (columnas separadas por 2+ espacios)
-function Get-WinGetUpgradeIds {
+# Convierte la salida de 'winget upgrade' en objetos Name/Id/Version/Available.
+function Get-WinGetUpgradeItems {
     param([string[]]$Lines)
     # Se parsea por POSICIÓN de columna (según la cabecera): cuando el nombre llena su columna
     # solo queda 1 espacio antes del Id y separar por 2+ espacios devolvía la versión como Id.
     if (-not $PSBoundParameters.ContainsKey('Lines')) { $Lines = Get-WinGetUpgradesList }
-    $idStart = -1; $verStart = -1
-    $ids = foreach ($raw in $lines) {
+    $idStart = -1; $verStart = -1; $availStart = -1
+    $items = foreach ($raw in $Lines) {
         $line = $raw.TrimEnd()
         if ($line -match '^Name\s+Id\s+Version') {                      # cabecera (se repite en la 2ª tabla)
-            $idStart  = $line.IndexOf('Id')
-            $verStart = $line.IndexOf('Version')
+            $idStart    = $line.IndexOf('Id')
+            $verStart   = $line.IndexOf('Version')
+            $availStart = $line.IndexOf('Available')
             continue
         }
         if ($idStart -lt 0) { continue }
@@ -539,10 +704,30 @@ function Get-WinGetUpgradeIds {
         if ($line -match '\d+\s+upgrades?\s+available') { continue }    # resumen
         if ($line -match '^(No\s|The following)') { continue }
         if ($line.Length -le $idStart) { continue }
-        $end = if ($verStart -gt $idStart -and $line.Length -ge $verStart) { $verStart - $idStart } else { $line.Length - $idStart }
-        $line.Substring($idStart, $end).Trim()
+        $cut = {
+            param($from, $to)
+            if ($from -lt 0 -or $line.Length -le $from) { return '' }
+            $len = if ($to -gt $from -and $line.Length -ge $to) { $to - $from } else { $line.Length - $from }
+            $line.Substring($from, $len).Trim()
+        }
+        $verEnd = if ($availStart -gt $verStart) { $availStart } else { -1 }
+        [pscustomobject]@{
+            Name      = $line.Substring(0, [Math]::Min($idStart, $line.Length)).Trim()
+            Id        = (& $cut $idStart $verStart)
+            Version   = (& $cut $verStart $verEnd)
+            Available = $(if ($availStart -gt 0) { & $cut $availStart -1 } else { '' })
+        }
     }
-    return @($ids | Where-Object { $_ -match '^[\w\.\+\-]+$' } | Select-Object -Unique)
+    # Quitar la columna Source (último token) de Available y filtrar Ids no validos.
+    $items = @($items | Where-Object { $_.Id -match '^[\w\.\+\-]+$' })
+    foreach ($i in $items) { $i.Available = ($i.Available -split '\s+')[0] }
+    return @($items | Sort-Object Id -Unique)
+}
+
+function Get-WinGetUpgradeIds {
+    param([string[]]$Lines)
+    if (-not $PSBoundParameters.ContainsKey('Lines')) { $Lines = Get-WinGetUpgradesList }
+    return @(Get-WinGetUpgradeItems -Lines $Lines | ForEach-Object { $_.Id })
 }
 
 function Resolve-WinGetFailure {
@@ -556,12 +741,13 @@ function Resolve-WinGetFailure {
     $manualCommand = "winget $Operation --id '$quotedId' --exact --interactive --accept-package-agreements --accept-source-agreements"
     $diagnosticFolder = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir'
     try {
-        $recoveryFile = Join-Path $OutputFolder 'WinGet-Recuperacion-manual.log'
+        $recoveryFile = Join-Path $LogFolder 'WinGet-Recuperacion-manual.log'
         @("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Id", $Details, "Comando: $manualCommand", "Transcript: $tsFile", "Diagnosticos WinGet: $diagnosticFolder", '') |
             Add-Content -LiteralPath $recoveryFile -Encoding UTF8 -ErrorAction Stop
         Write-Info "Comando y error guardados en $recoveryFile"
     } catch { Write-WarnMsg "No se pudo guardar la recuperacion: $($_.Exception.Message)" }
 
+    $script:Failures.Add("WinGet ${Id}: $Operation fallido")
     if ($ScheduledRun -or -not [Environment]::UserInteractive) {
         Write-WarnMsg "Recuperacion manual pendiente para ${Id}: $manualCommand"
         return
@@ -576,7 +762,7 @@ function Resolve-WinGetFailure {
     try {
         Write-Info "Reintentando ${Id} con instalador interactivo..."
         Invoke-WinGet $Operation --id $Id --exact --interactive --accept-package-agreements --accept-source-agreements | ForEach-Object { Write-Host $_ }
-        if ($LASTEXITCODE -eq 0) { Write-Ok "$Id completado mediante instalacion interactiva." }
+        if ($LASTEXITCODE -eq 0) { Write-Ok "$Id completado mediante instalacion interactiva."; $script:Successes.Add("WinGet ${Id}") }
         else {
             Write-WarnMsg "El reintento de $Id fallo (codigo $LASTEXITCODE). Comando manual: $manualCommand"
             "Reintento de ${Id}: codigo $LASTEXITCODE" | Add-Content -LiteralPath $recoveryFile -Encoding UTF8 -ErrorAction SilentlyContinue
@@ -585,7 +771,7 @@ function Resolve-WinGetFailure {
 }
 
 function Update-WinGetApps {
-    Write-Info "=== Actualizando aplicaciones con WinGet... ==="
+    Write-Section 2 4 'Aplicaciones (WinGet)'
     if (-not (Test-WinGetInstalled) -or $ForceWinGetReinstall) {
         Write-WarnMsg "WinGet no esta disponible o se solicito reinstalacion."
         $installApproved = $ForceWinGetReinstall -or (Confirm-WinGetInstallation)
@@ -608,70 +794,111 @@ function Update-WinGetApps {
     Ensure-WinGetSources
     try {
         $upgrades = Get-WinGetUpgradesList
-        if (-not $upgrades -or $upgrades.Count -eq 0) { Write-Ok "✅ No hay actualizaciones WinGet disponibles."; return }
+        $items = @(Get-WinGetUpgradeItems -Lines $upgrades)
+        $excluded = Get-ExcludedIds
 
-        Write-WarnMsg "✨ Aplicaciones con actualización (WinGet):"
-        $upgrades | ForEach-Object { Write-Host (" - " + $_) -ForegroundColor White }
-
-        $ids = Get-WinGetUpgradeIds -Lines $upgrades
-        if (-not $ids -or $ids.Count -eq 0) {
-            Write-WarnMsg "⚠️ No se pudieron extraer los Id de paquete; reintento con 'winget upgrade --all'..."
-            Invoke-WinGet upgrade --all --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
-            Write-Ok "✅ Actualización WinGet completada."
+        if ($items.Count -eq 0) {
+            if (($upgrades -join "`n") -match 'No installed package found|No applicable upgrade') {
+                Write-Ok "✅ No hay actualizaciones WinGet disponibles."
+                return
+            }
+            Write-WarnMsg "⚠️ No se pudo interpretar la lista de WinGet."
+            if ($DryRun) { return }
+            Write-WarnMsg "   Reintento con 'winget upgrade --all'..."
+            if ($excluded.Count -gt 0) { Write-WarnMsg "   Las exclusiones no se aplican en este modo de respaldo." }
+            $wgArgs = @('upgrade','--all') + @(Get-WinGetUpgradeFlags) + @('--accept-package-agreements','--accept-source-agreements','--silent','--disable-interactivity')
+            Invoke-WinGet @wgArgs
+            if ($LASTEXITCODE -ne 0) { $script:Failures.Add("WinGet upgrade --all: codigo $LASTEXITCODE") }
+            else { $script:Successes.Add('WinGet (--all)') }
             return
         }
 
+        # Tabla de pendientes
+        Write-WarnMsg ("📋 Actualizaciones disponibles: {0}" -f $items.Count)
+        ($items | Format-Table @{n='Aplicación';e={$_.Name}}, @{n='Id';e={$_.Id}}, @{n='Actual';e={$_.Version}}, @{n='Nueva';e={$_.Available}} -AutoSize |
+            Out-String -Width 200).TrimEnd().Split("`n") | Where-Object { $_.Trim() } | ForEach-Object { Write-Host "  $($_.TrimEnd())" -ForegroundColor White }
+
+        if ($DryRun) { Write-WarnMsg "DryRun: no se instala nada con WinGet."; return }
+
+        $toInstall = @($items | Where-Object { $excluded -notcontains $_.Id })
+        foreach ($skippedItem in @($items | Where-Object { $excluded -contains $_.Id })) {
+            Write-Detail "Omitido por exclusión: $($skippedItem.Id)"
+            $script:Skipped.Add("WinGet $($skippedItem.Id): excluido")
+        }
+        Write-Host ''
+
         # Se actualiza paquete por paquete: si uno falla (p. ej. requiere --location),
         # 'winget upgrade --all' aborta todo el lote restante. Uno por uno, un fallo no bloquea al resto.
-        foreach ($id in $ids) {
+        $index = 0
+        foreach ($item in $toInstall) {
+            $index++
+            $id = $item.Id
+            $label = "  [{0}/{1}] {2} ({3} → {4})" -f $index, $toInstall.Count, $id, $item.Version, $item.Available
+            Write-Host $label -NoNewline -ForegroundColor White
+            Write-Host ' ... ' -NoNewline
             try {
-            Write-Info "🔄 Actualizando $id..."
-            $packageOutput = [Collections.Generic.List[string]]::new()
-            Invoke-WinGet upgrade --id $id --include-unknown --include-pinned --accept-package-agreements --accept-source-agreements --silent --disable-interactivity 2>&1 |
-                ForEach-Object { $packageOutput.Add([string]$_); Write-Host $_ }
-            if ($LASTEXITCODE -eq 0) {
-                Write-Ok "✅ $id actualizado."
-            } elseif ($LASTEXITCODE -eq -1978335090) {
-                Write-WarnMsg "⚠️ ${id}: tecnología de instalación distinta; se aplica desinstalar + reinstalar automáticamente."
-                if ($id -eq 'Microsoft.Edge') {
-                    # Edge no se desinstala: se fuerza su actualizador propio.
-                    $eu = @("${env:ProgramFiles(x86)}\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe","$env:ProgramFiles\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-                    if ($eu) {
-                        Start-Process -FilePath $eu -ArgumentList '/ua /installsource scheduler' -Wait -NoNewWindow
-                        Write-Ok "✅ Edge: se lanzó su actualizador integrado."
-                    } else { Write-WarnMsg "⚠️ No se encontró MicrosoftEdgeUpdate.exe." }
-                } else {
-                    Invoke-WinGet uninstall --id $id --silent --disable-interactivity
-                    if ($LASTEXITCODE -eq 0) {
-                        Invoke-WinGet install --id $id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-                        if ($LASTEXITCODE -eq 0) { Write-Ok "✅ $id reinstalado en la versión nueva." }
-                        else { Resolve-WinGetFailure -Id $id -Operation install -Details "Reinstalacion fallida: codigo $LASTEXITCODE" }
+                $packageOutput = [Collections.Generic.List[string]]::new()
+                $wgArgs = @('upgrade','--id',$id,'--exact') + @(Get-WinGetUpgradeFlags) + @('--accept-package-agreements','--accept-source-agreements','--silent','--disable-interactivity')
+                Invoke-WinGet @wgArgs 2>&1 | ForEach-Object { $packageOutput.Add([string]$_) }
+                $code = $LASTEXITCODE
+                if ($code -eq 0) {
+                    Write-Ok 'OK'
+                    $script:Successes.Add("WinGet $id")
+                } elseif ($code -eq -1978334956) {
+                    # WinGet no puede actualizar este paquete (lo gestiona el editor): no es un fallo ni se reintenta.
+                    Write-Host 'OMITIDO' -ForegroundColor Cyan
+                    Write-Detail "El editor no permite actualizarlo con WinGet; use su propio método."
+                    $script:Skipped.Add("WinGet ${id}: actualizar con el método del editor")
+                } elseif ($code -eq -1978335090 -and -not $AllowReinstall -and $id -ne 'Microsoft.Edge') {
+                    Write-Host 'REQUIERE REINSTALAR' -ForegroundColor Yellow
+                    Write-Detail "Tecnología de instalación distinta. Use -AllowReinstall para permitir desinstalar + reinstalar."
+                    $script:Failures.Add("WinGet ${id}: requiere reinstalacion manual (-AllowReinstall)")
+                } elseif ($code -eq -1978335090) {
+                    Write-Host 'REINSTALANDO' -ForegroundColor Yellow
+                    if ($id -eq 'Microsoft.Edge') {
+                        # Edge no se desinstala: se fuerza su actualizador propio.
+                        $eu = @("${env:ProgramFiles(x86)}\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe","$env:ProgramFiles\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+                        if ($eu) {
+                            Start-Process -FilePath $eu -ArgumentList '/ua /installsource scheduler' -Wait -NoNewWindow
+                            Write-Detail "Edge: se lanzó su actualizador integrado."
+                            $script:Successes.Add("WinGet $id (actualizador propio)")
+                        } else { Write-Detail "No se encontró MicrosoftEdgeUpdate.exe."; $script:Failures.Add("WinGet ${id}: sin MicrosoftEdgeUpdate.exe") }
                     } else {
-                        Write-WarnMsg "⚠️ No se pudo desinstalar $id (código $LASTEXITCODE). Continúo."
-                        Resolve-WinGetFailure -Id $id -Details "No se pudo desinstalar: codigo $LASTEXITCODE"
+                        Invoke-WinGet uninstall --id $id --exact --silent --disable-interactivity 2>&1 | Out-Null
+                        if ($LASTEXITCODE -eq 0) {
+                            Invoke-WinGet install --id $id --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
+                            if ($LASTEXITCODE -eq 0) { Write-Detail "Reinstalado en la versión nueva."; $script:Successes.Add("WinGet $id (reinstalado)") }
+                            else { Resolve-WinGetFailure -Id $id -Operation install -Details "Reinstalacion fallida: codigo $LASTEXITCODE" }
+                        } else {
+                            Resolve-WinGetFailure -Id $id -Details "No se pudo desinstalar: codigo $LASTEXITCODE"
+                        }
                     }
+                } else {
+                    Write-Host "FALLO (código $code)" -ForegroundColor Red
+                    $packageOutput | Where-Object { $_ -match '\S' } | Select-Object -Last 4 | ForEach-Object { Write-Detail $_.Trim() }
+                    Resolve-WinGetFailure -Id $id -Details ("Codigo: $code`n" + ($packageOutput -join [Environment]::NewLine))
                 }
-            } else {
-                Write-WarnMsg "⚠️ $id no se pudo actualizar (código $LASTEXITCODE). Continúo con el resto."
-                Resolve-WinGetFailure -Id $id -Details ("Codigo: $LASTEXITCODE`n" + ($packageOutput -join [Environment]::NewLine))
-            }
             } catch {
-                Write-WarnMsg "⚠️ Error procesando ${id}: $($_.Exception.Message). Continúo con el resto."
+                Write-Host 'ERROR' -ForegroundColor Red
+                Write-Detail $_.Exception.Message
                 Resolve-WinGetFailure -Id $id -Details $_.Exception.Message
             }
         }
-        Write-Ok "✅ Actualización WinGet completada."
     } catch {
+        $script:Failures.Add("WinGet: $($_.Exception.Message)")
         Write-ErrMsg "❌ Error en WinGet: $($_.Exception.Message)"
     }
 }
+
 
 # -------------------------
 # Microsoft Store
 # -------------------------
 function Update-MicrosoftStore {
-    Write-Info "=== Actualizando apps de Microsoft Store... ==="
+    Write-Section 3 4 'Microsoft Store'
     if ($SkipStore) { Write-WarnMsg "ℹ️ Se solicitó omitir Microsoft Store."; return }
+    if ($DryRun) { Write-WarnMsg "ℹ️ DryRun: se omite Microsoft Store."; return }
+    if ($ScheduledRun) { Write-WarnMsg "ℹ️ Ejecución programada (SYSTEM, sin sesión de usuario): se omite Microsoft Store."; return }
     if (Get-IsServer) { Write-WarnMsg "ℹ️ Equipo tipo Server: se omite Microsoft Store."; return }
 
     $storeApp = Get-AppxPackage -Name Microsoft.WindowsStore -ErrorAction SilentlyContinue
@@ -681,7 +908,7 @@ function Update-MicrosoftStore {
     try {
         $wsresetPath = "C:\Windows\System32\wsreset.exe"
         if (Test-Path $wsresetPath) {
-            Write-WarnMsg "🔄 Limpiando caché de Microsoft Store (wsreset)..."
+            Write-Detail "Limpiando caché de Microsoft Store (wsreset)..."
             Start-Process -FilePath $wsresetPath -NoNewWindow -Wait
         } else {
             Write-WarnMsg "⚠️ wsreset.exe no encontrado; continúo sin limpieza."
@@ -689,13 +916,18 @@ function Update-MicrosoftStore {
 
         if (Test-WinGetInstalled) {
             Ensure-WinGetSources
-            Write-Info "🔄 Actualizando apps Store vía WinGet (msstore)..."
-            Invoke-WinGet upgrade --source msstore --all --include-unknown --accept-package-agreements --accept-source-agreements --silent --disable-interactivity
+            Write-Detail "Actualizando apps Store vía WinGet (msstore)..."
+            $wgArgs = @('upgrade','--source','msstore','--all') + @(Get-WinGetUpgradeFlags) + @('--accept-package-agreements','--accept-source-agreements','--silent','--disable-interactivity')
+            $storeOut = @(Invoke-WinGet @wgArgs 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_ -match '\S' -and $_ -notmatch 'msstore. source requires|Terms of Transaction|geographic region' })
+            $storeOut | ForEach-Object { Write-Detail $_.Trim() }
+            # -1978335212 = "No installed package found" (nada que actualizar en msstore): no es fallo.
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335212) { $script:Failures.Add("Store (winget msstore): codigo $LASTEXITCODE") }
         } else {
             Write-WarnMsg "⚠️ WinGet no está presente; solo se ejecutó wsreset."
         }
         Write-Ok "✅ Proceso de Microsoft Store finalizado."
     } catch {
+        $script:Failures.Add("Store: $($_.Exception.Message)")
         Write-ErrMsg "❌ Error en Microsoft Store: $($_.Exception.Message)"
     }
 }
@@ -715,40 +947,59 @@ function Ensure-NuGetProvider {
 }
 
 function Update-WindowsDriversAndUpdates {
-    Write-Info "=== Iniciando Windows Update (sistema y drivers)... ==="
+    Write-Section 4 4 'Windows Update (sistema y drivers)'
     if (-not (Test-IsAdmin)) { Write-WarnMsg "ℹ️ Ejecuta como Administrador para aplicar Windows Update sin restricciones."; }
     if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg "❌ Sin Internet. Abortando Windows Update."; return }
-
-    # Reinicio de servicios base
-    $services = @("wuauserv","cryptsvc")
-    Write-WarnMsg "🔄 Reiniciando servicios de Windows Update..."
-    foreach ($s in $services) {
-        try {
-            Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
-            Start-Service -Name $s -ErrorAction Stop
-            Write-Ok ("✅ Servicio {0} reiniciado." -f ${s})
-        } catch {
-            Write-WarnMsg ("⚠️ No se pudo reiniciar {0}: {1}" -f ${s}, $_.Exception.Message)
-        }
-    }
 
     # PSWindowsUpdate
     try {
         Ensure-NuGetProvider
         if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
             Write-WarnMsg "📥 Instalando módulo PSWindowsUpdate..."
-            Install-Module PSWindowsUpdate -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            # AllUsers (si hay admin): bajo SYSTEM, CurrentUser iria al perfil de SYSTEM.
+            $moduleScope = if (Test-IsAdmin) { 'AllUsers' } else { 'CurrentUser' }
+            Install-Module PSWindowsUpdate -Scope $moduleScope -Force -AllowClobber -ErrorAction Stop
         }
         Import-Module PSWindowsUpdate -ErrorAction Stop
-        Write-Info "🔍 Buscando e instalando actualizaciones..."
-        Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot | Out-Null
-        Write-Ok "✅ Actualizaciones instaladas correctamente."
+
+        if ($DryRun) {
+            Write-Info "🔍 DryRun: actualizaciones de Windows pendientes (no se instalan)..."
+            Get-WindowsUpdate -MicrosoftUpdate | Format-Table -AutoSize | Out-String | Write-Host
+        } else {
+            Write-Detail "Buscando e instalando actualizaciones..."
+            $wuResult = $null
+            try {
+                $wuResult = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot -ErrorAction Stop
+            } catch {
+                # Solo si falla se reinician los servicios y se reintenta una vez.
+                Write-WarnMsg "⚠️ Falló Windows Update ($($_.Exception.Message)); reinicio servicios y reintento una vez..."
+                foreach ($s in @('wuauserv','cryptsvc')) {
+                    try { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue; Start-Service -Name $s -ErrorAction Stop }
+                    catch { Write-WarnMsg ("⚠️ No se pudo reiniciar {0}: {1}" -f $s, $_.Exception.Message) }
+                }
+                $wuResult = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot -ErrorAction Stop
+            }
+            if ($wuResult) {
+                Write-WarnMsg ("📋 Actualizaciones procesadas: {0}" -f @($wuResult).Count)
+                ($wuResult | Format-Table KB, Status, Size, Title -AutoSize | Out-String -Width 200).TrimEnd().Split("`n") | Where-Object { $_.Trim() } |
+                    ForEach-Object { Write-Host "  $($_.TrimEnd())" -ForegroundColor White }
+                $script:Successes.Add("Windows Update ($(@($wuResult).Count))")
+            } else {
+                Write-Ok "✅ No hay actualizaciones de Windows pendientes."
+            }
+        }
     } catch {
+        $script:Failures.Add("Windows Update: $($_.Exception.Message)")
         Write-ErrMsg "❌ Error con PSWindowsUpdate: $($_.Exception.Message)"
     }
 
-    if (Get-PendingReboot) { Write-WarnMsg "⚠️ Se requiere reiniciar el sistema para aplicar cambios." }
-    else { Write-Ok "✅ No es necesario reiniciar." }
+    if (Get-PendingReboot) {
+        Write-WarnMsg "⚠️ Se requiere reiniciar el sistema para aplicar cambios."
+        if ($RebootPolicy -eq 'IfPending' -and -not $DryRun) {
+            Write-WarnMsg "🔁 RebootPolicy=IfPending: el equipo se reiniciará en 60 segundos (cancelar: shutdown /a)."
+            $script:RebootScheduled = $true
+        }
+    } else { Write-Ok "✅ No es necesario reiniciar." }
 }
 
 # Chequeo de reinicio pendiente
@@ -769,27 +1020,31 @@ function Read-UpdaterYesNo {
 }
 
 function Configure-UpdaterScheduledTask {
-    if ($ScheduledRun -or -not [Environment]::UserInteractive) { return }
-    if (-not (Read-UpdaterYesNo 'Desea crear una tarea automatica semanal para este script?')) { return }
-    if (-not (Test-IsAdmin)) {
-        Write-WarnMsg 'Ejecute como Administrador para crear la tarea programada.'
-        return
-    }
+    if ($ScheduledRun -or $SkipScheduleTask -or $DryRun -or -not [Environment]::UserInteractive) { return }
     try {
         $scriptPath = $script:UpdaterScriptPath
         if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath)) { throw 'Se requiere ejecutar el script desde un archivo guardado.' }
+        $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
+        try { $pathHash = [BitConverter]::ToString($hashAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($scriptPath.ToLowerInvariant()))).Replace('-', '').Substring(0, 12) }
+        finally { $hashAlgorithm.Dispose() }
+        $taskName = "UpdateAppsDrivers8.1-$pathHash"
+        $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        # Si ya esta programada no se vuelve a preguntar (usar -ReconfigureTask para cambiarla).
+        if ($existing -and -not $ReconfigureTask) {
+            Write-Info "Tarea programada $taskName ya existe; no se solicita programacion. Use -ReconfigureTask para modificarla."
+            return
+        }
+        if (-not $existing -and -not (Read-UpdaterYesNo 'Desea crear una tarea automatica semanal para este script?')) { return }
+        if (-not (Test-IsAdmin)) {
+            Write-WarnMsg 'Ejecute como Administrador para crear la tarea programada.'
+            return
+        }
         $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
         if (-not (Test-Path -LiteralPath $pwshPath)) {
             $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
             if (-not $command) { throw 'PowerShell 7 debe estar instalado antes de programar la tarea.' }
             $pwshPath = $command.Source
         }
-        $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
-        try { $pathHash = [BitConverter]::ToString($hashAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($scriptPath.ToLowerInvariant()))).Replace('-', '').Substring(0, 12) }
-        finally { $hashAlgorithm.Dispose() }
-        $taskName = "UpdateAppsDrivers8.1-$pathHash"
-        $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existing -and -not (Read-UpdaterYesNo "La tarea $taskName ya existe. Desea reemplazar su horario?")) { return }
 
         Write-Info 'Dia semanal: 1=Lunes, 2=Martes, 3=Miercoles, 4=Jueves, 5=Viernes, 6=Sabado, 7=Domingo.'
         do { $day = (Read-Host 'Seleccione el dia (1-7)').Trim() } while ($day -notmatch '^[1-7]$')
@@ -800,10 +1055,17 @@ function Configure-UpdaterScheduledTask {
         Write-Info "La tarea se ejecutara como SYSTEM cada $($dayNames[[int]$day - 1]) a las $time, con instalacion automatica de WinGet si falta."
         $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScheduledRun -OutputFolder "{1}"' -f $scriptPath, $OutputFolder.TrimEnd('\')
         if ($SkipStore) { $arguments += ' -SkipStore' }
+        if ($IncludePinned) { $arguments += ' -IncludePinned' }
+        if ($IncludeUnknown) { $arguments += ' -IncludeUnknown' }
+        if ($AllowReinstall) { $arguments += ' -AllowReinstall' }
+        if ($ExcludeIds.Count -gt 0) { $arguments += (' -ExcludeIds "{0}"' -f ($ExcludeIds -join ',')) }
+        $arguments += " -RebootPolicy $RebootPolicy -LogRetentionDays $LogRetentionDays"
         $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $arguments -WorkingDirectory (Split-Path -Parent $scriptPath) -ErrorAction Stop
         $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $days[[int]$day - 1] -At $at -ErrorAction Stop
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest -ErrorAction Stop
-        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ErrorAction Stop
+        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable `
+            -ExecutionTimeLimit (New-TimeSpan -Hours 4) -ErrorAction Stop
         $registration = @{ TaskName=$taskName; Action=$action; Trigger=$trigger; Principal=$principal; Settings=$settings; Description="Actualizaciones semanales de aplicaciones y drivers: $scriptPath"; ErrorAction='Stop' }
         if ($existing) { $registration.Force = $true }
         Register-ScheduledTask @registration | Out-Null
@@ -814,10 +1076,15 @@ function Configure-UpdaterScheduledTask {
 # -------------------------
 # MAIN
 # -------------------------
-Write-Info "Iniciando actualizaciones automáticas de aplicaciones y del sistema..."
-Write-Host (" - PowerShell:  {0}" -f $PSVersionTable.PSVersion)
-Write-Host (" - Admin:       {0}" -f $(if (Test-IsAdmin) { 'Sí' } else { 'No' }))
-Write-Host (" - Carpeta log: {0}" -f $OutputFolder)
+Write-Host ''
+Write-Host ('█' * 70) -ForegroundColor Cyan
+Write-Host '  ACTUALIZACIÓN DE APLICACIONES, DRIVERS Y WINDOWS' -ForegroundColor Cyan
+Write-Host ('█' * 70) -ForegroundColor Cyan
+Write-Host ("  Equipo:     {0}" -f $env:COMPUTERNAME)
+Write-Host ("  PowerShell: {0}" -f $PSVersionTable.PSVersion)
+Write-Host ("  Admin:      {0}" -f $(if (Test-IsAdmin) { 'Sí' } else { 'No' }))
+Write-Host ("  Modo:       {0}" -f $(if ($DryRun) { 'DryRun (solo listar)' } elseif ($ScheduledRun) { 'Programado' } else { 'Manual' }))
+Write-Host ("  Carpeta log: {0}" -f $LogFolder)
 
 # Si PS < 7, relanzar o instalar automaticamente (salvo -NoRelaunch).
 $needPwsh = ($PSVersionTable.PSVersion.Major -lt 7)
@@ -840,6 +1107,9 @@ if (-not (Test-IsAdmin)) {
     Write-WarnMsg "ℹ️ Sugerencia: ejecuta como Administrador para mejores resultados (servicios, WU, instalación de PS7...)."
 }
 
+if ($DryRun) { Write-WarnMsg "ℹ️ Modo DryRun: solo se listan las actualizaciones pendientes." }
+if (Get-PendingReboot) { Write-WarnMsg "⚠️ Ya hay un reinicio pendiente antes de empezar; algunas instalaciones podrían fallar." }
+
 # Flujo de actualización
 Configure-UpdaterScheduledTask
 Update-RuckZuckApps
@@ -847,5 +1117,24 @@ Update-WinGetApps
 Update-MicrosoftStore
 Update-WindowsDriversAndUpdates
 
-Write-Ok "✅ Proceso finalizado."
+# Resumen final
+Write-Host ''
+Write-Host ('█' * 70) -ForegroundColor Cyan
+Write-Host '  RESUMEN' -ForegroundColor Cyan
+Write-Host ('█' * 70) -ForegroundColor Cyan
+Write-Host ("  ✔ Correctos:      {0}" -f $script:Successes.Count) -ForegroundColor Green
+$script:Successes | ForEach-Object { Write-Host "      • $_" -ForegroundColor Green }
+if ($script:Skipped.Count -gt 0) {
+    Write-Host ("  ➜ Omitidos:       {0}" -f $script:Skipped.Count) -ForegroundColor Cyan
+    $script:Skipped | ForEach-Object { Write-Host "      • $_" -ForegroundColor Cyan }
+}
+Write-Host ("  ✖ Con problemas:  {0}" -f $script:Failures.Count) -ForegroundColor $(if ($script:Failures.Count -gt 0) { 'Yellow' } else { 'Green' })
+$script:Failures | ForEach-Object { Write-Host "      • $_" -ForegroundColor Yellow }
+Write-Host ("  Reinicio pendiente: {0}" -f $(if (Get-PendingReboot) { 'Sí' } else { 'No' }))
+Write-Host ("  Log: {0}" -f $tsFile)
+Write-Host ''
+if ($script:Failures.Count -gt 0) { Write-WarnMsg "⚠️ Proceso finalizado con incidencias." } else { Write-Ok "✅ Proceso finalizado sin incidencias." }
 try { Stop-Transcript | Out-Null } catch {}
+
+if ($script:RebootScheduled) { & shutdown.exe /r /t 60 /c "Reinicio por actualizaciones pendientes" }
+exit $(if ($script:Failures.Count -gt 0) { 1 } else { 0 })

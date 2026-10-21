@@ -6,6 +6,7 @@ if($errors.Count){throw ($errors | Out-String)}
 $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-WinGetFailure'},$true)
 . ([scriptblock]::Create($definition.Extent.Text))
 function Write-Info($msg) {}
+$script:Failures=[Collections.Generic.List[string]]::new(); $script:Successes=[Collections.Generic.List[string]]::new()
 function Write-Ok($msg) {}
 function Write-WarnMsg($msg) {}
 function Write-Host { param($Object,$ForegroundColor) $script:Messages.Add([string]$Object) }
@@ -20,7 +21,7 @@ function Reset-RecoveryTest([string[]]$Answers) {
     $script:Messages=[Collections.Generic.List[string]]::new()
     $script:RetryCode=0; $script:ThrowRetry=$false
 }
-$OutputFolder='C:\Medios'; $tsFile='C:\Medios\Actualizar-test.log'; $ScheduledRun=$false
+$OutputFolder='C:\Medios'; $LogFolder='C:\Medios'; $tsFile='C:\Medios\Actualizar-test.log'; $ScheduledRun=$false
 Reset-RecoveryTest @('4','2')
 Resolve-WinGetFailure -Id 'Microsoft.SQLServer.OLEDBDriver' -Details '1603; Installer log: C:\Logs\ole.log'
 if($script:Calls.Count -ne 0 -or ($script:Messages -join ' ') -notmatch 'winget upgrade.*--exact --interactive'){throw 'Opcion 2 incorrecta'}
@@ -41,3 +42,4 @@ Reset-RecoveryTest @()
 Resolve-WinGetFailure -Id 'Test.App' -Details 'fallo automatico'
 if($script:Calls.Count -or -not $script:Records.Count){throw 'Modo programado incorrecto'}
 'PASS: mostrar comando, omitir, reintento visible, fallo y excepcion, registro de log y ScheduledRun sin preguntas.'
+

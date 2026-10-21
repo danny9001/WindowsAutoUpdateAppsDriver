@@ -3,7 +3,7 @@ $file = Join-Path (Split-Path $PSScriptRoot -Parent) 'UpdateAppsDrivers8.1.ps1'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Get-WinGetUpgradeIds','Update-WinGetApps')},$true)) {
+foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Get-WinGetUpgradeItems','Get-WinGetUpgradeIds','Update-WinGetApps')},$true)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 $script:Expected=@('Microsoft.SQLServer.OLEDBDriver','Microsoft.VCRedist.2015+.x64','Microsoft.VCRedist.2015+.x86')
@@ -18,6 +18,12 @@ $script:Lines=@(
 $ids=@(Get-WinGetUpgradeIds -Lines $script:Lines)
 if (($ids -join ',') -ne ($script:Expected -join ',')) { throw "IDs incorrectos: $ids" }
 function Write-Info($msg) {}
+function Write-Section { param($Number,$Total,$Title) }
+function Write-Detail($msg) {}
+function Get-ExcludedIds { return @() }
+function Get-WinGetUpgradeFlags { return @() }
+$DryRun=$false; $AllowReinstall=$false
+$script:Failures=[Collections.Generic.List[string]]::new(); $script:Successes=[Collections.Generic.List[string]]::new(); $script:Skipped=[Collections.Generic.List[string]]::new()
 function Write-Ok($msg) {}
 function Write-WarnMsg($msg) {}
 function Write-ErrMsg($msg) { throw $msg }
@@ -42,3 +48,4 @@ foreach($mode in @($false,$true)) {
     if (($script:Attempts -join ',') -ne ($script:Expected -join ',')) { throw "No continuo todos los paquetes: $script:Attempts" }
 }
 Write-Output 'PASS: IDs con +, continuidad tras codigo 1603/WinGet y excepcion, tres paquetes intentados.'
+
