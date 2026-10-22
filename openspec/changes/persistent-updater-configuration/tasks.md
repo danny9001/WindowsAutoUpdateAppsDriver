@@ -1,0 +1,5 @@
+- [x] Documentar propuesta y diseno.
+- [x] Implementar JSON, validacion y persistencia.
+- [x] Integrar menus, exclusiones y tarea configurada.
+- [x] Probar y documentar uso (Configuration, WinGetRecovery, WinGetContinuation y ScheduledTask: PASS).
+- [x] Preparar publicacion y sincronizacion de script/config de ejemplo local; preservar configuracion local existente.

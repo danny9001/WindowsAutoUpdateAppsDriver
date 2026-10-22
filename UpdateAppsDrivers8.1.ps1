@@ -48,6 +48,7 @@
   Carpeta para descargas y logs (por defecto, carpeta del script).
 
 .NOTES
+  - Lee UpdateAppsDrivers8.1.config.json junto al script; lo crea sin preguntas si falta.
   - En Windows Server se omiten tareas de Microsoft Store.
   - Requiere privilegios de admin para partes de Windows Update e instalación de PS7.
 #>
@@ -97,6 +98,61 @@ function Write-Section {
 
 # Salida UTF-8 para leer bien la salida de winget (evita caracteres como "┬«")
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch {}
+
+function Save-UpdaterConfiguration {
+    $temporaryFile = "$($script:UpdaterConfigPath).$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $script:UpdaterConfig | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $temporaryFile -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $temporaryFile -Destination $script:UpdaterConfigPath -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path -LiteralPath $temporaryFile) { Remove-Item -LiteralPath $temporaryFile -ErrorAction SilentlyContinue }
+    }
+}
+
+function Initialize-UpdaterConfiguration {
+    $script:UpdaterConfigPath = Join-Path (Split-Path -Parent $script:UpdaterScriptPath) 'UpdateAppsDrivers8.1.config.json'
+    $script:UpdaterConfig = [pscustomobject]@{
+        AskQuestions = $false
+        SkipStore = $false
+        SkipPackages = @()
+        InstallWinGetIfMissing = $true
+        Schedule = [pscustomobject]@{ Enabled=$false; DayOfWeek='Sunday'; Time='22:00' }
+    }
+    if (Test-Path -LiteralPath $script:UpdaterConfigPath) {
+        try {
+            $data = Get-Content -LiteralPath $script:UpdaterConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $data -or $data -isnot [pscustomobject]) { throw 'Se requiere un objeto JSON.' }
+            foreach ($name in @('AskQuestions','SkipStore','InstallWinGetIfMissing')) {
+                if ($data.PSObject.Properties.Name -contains $name) {
+                    if ($data.$name -isnot [bool]) { throw "$name debe ser true o false." }
+                    $script:UpdaterConfig.$name = $data.$name
+                }
+            }
+            if ($data.PSObject.Properties.Name -contains 'SkipPackages') {
+                if ($data.SkipPackages -isnot [array]) { throw 'SkipPackages debe ser un arreglo JSON.' }
+                foreach ($id in $data.SkipPackages) { if ($id -isnot [string] -or $id -notmatch '^[\w.\+\-]+$') { throw "ID omitido invalido: $id" } }
+                $script:UpdaterConfig.SkipPackages = @($data.SkipPackages | Select-Object -Unique)
+            }
+            if ($data.PSObject.Properties.Name -contains 'Schedule') {
+                if ($data.Schedule -isnot [pscustomobject]) { throw 'Schedule debe ser un objeto JSON.' }
+                foreach ($name in @('Enabled','DayOfWeek','Time')) {
+                    if ($data.Schedule.PSObject.Properties.Name -contains $name) { $script:UpdaterConfig.Schedule.$name = $data.Schedule.$name }
+                }
+            }
+            $schedule = $script:UpdaterConfig.Schedule
+            if ($schedule.Enabled -isnot [bool]) { throw 'Schedule.Enabled debe ser true o false.' }
+            if ($schedule.DayOfWeek -isnot [string] -or $schedule.DayOfWeek -cnotmatch '^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)$') { throw 'Schedule.DayOfWeek debe ser Monday a Sunday.' }
+            if ($schedule.Time -isnot [string] -or $schedule.Time -notmatch '^([01][0-9]|2[0-3]):[0-5][0-9]$') { throw 'Schedule.Time debe usar HH:mm.' }
+        } catch { throw "Configuracion invalida en $($script:UpdaterConfigPath): $($_.Exception.Message)" }
+    } elseif (-not $DryRun) {
+        Save-UpdaterConfiguration
+    }
+    Write-Info "Configuracion: $($script:UpdaterConfigPath)"
+}
+
+# Leer antes de actualizar o crear tareas; un JSON invalido detiene la ejecucion.
+Initialize-UpdaterConfiguration
+if ($script:UpdaterConfig.SkipStore) { $SkipStore = $true }
 
 # Asegurar carpeta de trabajo
 if (-not (Test-Path $OutputFolder)) {
@@ -511,7 +567,7 @@ function Test-WinGetInstalled {
 }
 
 function Confirm-WinGetInstallation {
-    if ($ScheduledRun) { return $true }
+    if ($ScheduledRun -or -not $script:UpdaterConfig.AskQuestions) { return $script:UpdaterConfig.InstallWinGetIfMissing }
     if (-not [Environment]::UserInteractive) {
         Write-WarnMsg 'WinGet no esta instalado y esta ejecucion no tiene interfaz para solicitar confirmacion.'
         return $false
@@ -668,6 +724,7 @@ function Get-WinGetUpgradeFlags {
 # Ids a omitir: -ExcludeIds + exclusiones.txt (junto al script).
 function Get-ExcludedIds {
     $list = [Collections.Generic.List[string]]::new()
+    foreach ($e in $script:UpdaterConfig.SkipPackages) { $list.Add($e) }
     foreach ($e in $ExcludeIds) { $list.Add($e) }
     $file = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'exclusiones.txt' } else { $null }
     if ($file -and (Test-Path -LiteralPath $file)) {
@@ -748,7 +805,7 @@ function Resolve-WinGetFailure {
     } catch { Write-WarnMsg "No se pudo guardar la recuperacion: $($_.Exception.Message)" }
 
     $script:Failures.Add("WinGet ${Id}: $Operation fallido")
-    if ($ScheduledRun -or -not [Environment]::UserInteractive) {
+    if ($ScheduledRun -or -not $script:UpdaterConfig.AskQuestions -or -not [Environment]::UserInteractive) {
         Write-WarnMsg "Recuperacion manual pendiente para ${Id}: $manualCommand"
         return
     }
@@ -758,7 +815,12 @@ function Resolve-WinGetFailure {
     Write-Host '  3. Omitir y continuar con los demas paquetes'
     do { $choice = (Read-Host 'Seleccione una opcion (1-3)').Trim() } while ($choice -notmatch '^[1-3]$')
     if ($choice -eq '2') { Write-Host $manualCommand -ForegroundColor Cyan; return }
-    if ($choice -ne '1') { return }
+    if ($choice -ne '1') {
+        $script:UpdaterConfig.SkipPackages = @(@($script:UpdaterConfig.SkipPackages) + $Id | Select-Object -Unique)
+        try { Save-UpdaterConfiguration; Write-Info "$Id guardado en SkipPackages para futuras ejecuciones." }
+        catch { Write-WarnMsg "No se pudo guardar la omision: $($_.Exception.Message)" }
+        return
+    }
     try {
         Write-Info "Reintentando ${Id} con instalador interactivo..."
         Invoke-WinGet $Operation --id $Id --exact --interactive --accept-package-agreements --accept-source-agreements | ForEach-Object { Write-Host $_ }
@@ -805,7 +867,7 @@ function Update-WinGetApps {
             Write-WarnMsg "⚠️ No se pudo interpretar la lista de WinGet."
             if ($DryRun) { return }
             Write-WarnMsg "   Reintento con 'winget upgrade --all'..."
-            if ($excluded.Count -gt 0) { Write-WarnMsg "   Las exclusiones no se aplican en este modo de respaldo." }
+            if ($excluded.Count -gt 0) { Write-WarnMsg 'Se omite el lote para respetar las exclusiones configuradas.'; return }
             $wgArgs = @('upgrade','--all') + @(Get-WinGetUpgradeFlags) + @('--accept-package-agreements','--accept-source-agreements','--silent','--disable-interactivity')
             Invoke-WinGet @wgArgs
             if ($LASTEXITCODE -ne 0) { $script:Failures.Add("WinGet upgrade --all: codigo $LASTEXITCODE") }
@@ -1020,7 +1082,20 @@ function Read-UpdaterYesNo {
 }
 
 function Configure-UpdaterScheduledTask {
-    if ($ScheduledRun -or $SkipScheduleTask -or $DryRun -or -not [Environment]::UserInteractive) { return }
+    if ($ScheduledRun -or $SkipScheduleTask -or $DryRun) { return }
+    $configuredSchedule = $script:UpdaterConfig.Schedule.Enabled
+    if (-not $configuredSchedule) {
+        if (-not $script:UpdaterConfig.AskQuestions -or -not [Environment]::UserInteractive) { return }
+        if (-not (Read-UpdaterYesNo 'Desea crear una tarea automatica semanal para este script?')) {
+            $script:UpdaterConfig.AskQuestions = $false
+            try { Save-UpdaterConfiguration } catch { Write-WarnMsg "No se pudo guardar la configuracion: $($_.Exception.Message)" }
+            return
+        }
+    }
+    if (-not (Test-IsAdmin)) {
+        Write-WarnMsg 'Ejecute como Administrador para crear la tarea programada.'
+        return
+    }
     try {
         $scriptPath = $script:UpdaterScriptPath
         if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath)) { throw 'Se requiere ejecutar el script desde un archivo guardado.' }
@@ -1029,16 +1104,7 @@ function Configure-UpdaterScheduledTask {
         finally { $hashAlgorithm.Dispose() }
         $taskName = "UpdateAppsDrivers8.1-$pathHash"
         $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        # Si ya esta programada no se vuelve a preguntar (usar -ReconfigureTask para cambiarla).
-        if ($existing -and -not $ReconfigureTask) {
-            Write-Info "Tarea programada $taskName ya existe; no se solicita programacion. Use -ReconfigureTask para modificarla."
-            return
-        }
-        if (-not $existing -and -not (Read-UpdaterYesNo 'Desea crear una tarea automatica semanal para este script?')) { return }
-        if (-not (Test-IsAdmin)) {
-            Write-WarnMsg 'Ejecute como Administrador para crear la tarea programada.'
-            return
-        }
+        if (-not $configuredSchedule -and $existing -and -not (Read-UpdaterYesNo "La tarea $taskName ya existe. Desea reemplazar su horario?")) { return }
         $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
         if (-not (Test-Path -LiteralPath $pwshPath)) {
             $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
@@ -1046,15 +1112,20 @@ function Configure-UpdaterScheduledTask {
             $pwshPath = $command.Source
         }
 
+        $days = @('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
+        $dayNames = @('Lunes','Martes','Miercoles','Jueves','Viernes','Sabado','Domingo')
+        if ($configuredSchedule) {
+            $day = [array]::IndexOf($days, [string]$script:UpdaterConfig.Schedule.DayOfWeek) + 1
+            $time = $script:UpdaterConfig.Schedule.Time
+        } else {
         Write-Info 'Dia semanal: 1=Lunes, 2=Martes, 3=Miercoles, 4=Jueves, 5=Viernes, 6=Sabado, 7=Domingo.'
         do { $day = (Read-Host 'Seleccione el dia (1-7)').Trim() } while ($day -notmatch '^[1-7]$')
         do { $time = (Read-Host 'Hora local del equipo en formato HH:mm (ejemplo 22:30)').Trim() } while ($time -notmatch '^([01][0-9]|2[0-3]):[0-5][0-9]$')
-        $days = @('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
-        $dayNames = @('Lunes','Martes','Miercoles','Jueves','Viernes','Sabado','Domingo')
+        }
         $at = [datetime]::Today.Add([TimeSpan]::ParseExact($time, 'hh\:mm', [Globalization.CultureInfo]::InvariantCulture))
         Write-Info "La tarea se ejecutara como SYSTEM cada $($dayNames[[int]$day - 1]) a las $time, con instalacion automatica de WinGet si falta."
         $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScheduledRun -OutputFolder "{1}"' -f $scriptPath, $OutputFolder.TrimEnd('\')
-        if ($SkipStore) { $arguments += ' -SkipStore' }
+        # Leer SkipStore del JSON en cada ejecucion, sin fijarlo en los argumentos de la tarea.
         if ($IncludePinned) { $arguments += ' -IncludePinned' }
         if ($IncludeUnknown) { $arguments += ' -IncludeUnknown' }
         if ($AllowReinstall) { $arguments += ' -AllowReinstall' }
@@ -1069,6 +1140,14 @@ function Configure-UpdaterScheduledTask {
         $registration = @{ TaskName=$taskName; Action=$action; Trigger=$trigger; Principal=$principal; Settings=$settings; Description="Actualizaciones semanales de aplicaciones y drivers: $scriptPath"; ErrorAction='Stop' }
         if ($existing) { $registration.Force = $true }
         Register-ScheduledTask @registration | Out-Null
+        $script:UpdaterConfig.SkipStore = [bool]$SkipStore
+        if (-not $configuredSchedule) {
+            $script:UpdaterConfig.Schedule.Enabled = $true
+            $script:UpdaterConfig.Schedule.DayOfWeek = $days[[int]$day - 1]
+            $script:UpdaterConfig.Schedule.Time = $time
+            $script:UpdaterConfig.AskQuestions = $false
+        }
+        Save-UpdaterConfiguration
         Write-Ok "Tarea $taskName creada: $($dayNames[[int]$day - 1]) a las $time (horario local). Conserve el script en $scriptPath."
     } catch { Write-ErrMsg "No se pudo crear la tarea programada: $($_.Exception.Message)" }
 }

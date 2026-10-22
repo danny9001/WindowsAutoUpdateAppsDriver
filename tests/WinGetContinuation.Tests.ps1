@@ -3,7 +3,7 @@ $file = Join-Path (Split-Path $PSScriptRoot -Parent) 'UpdateAppsDrivers8.1.ps1'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Get-WinGetUpgradeItems','Get-WinGetUpgradeIds','Update-WinGetApps')},$true)) {
+foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Get-ExcludedIds','Get-WinGetUpgradeItems','Get-WinGetUpgradeIds','Update-WinGetApps')},$true)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 $script:Expected=@('Microsoft.SQLServer.OLEDBDriver','Microsoft.VCRedist.2015+.x64','Microsoft.VCRedist.2015+.x86')
@@ -20,7 +20,6 @@ if (($ids -join ',') -ne ($script:Expected -join ',')) { throw "IDs incorrectos:
 function Write-Info($msg) {}
 function Write-Section { param($Number,$Total,$Title) }
 function Write-Detail($msg) {}
-function Get-ExcludedIds { return @() }
 function Get-WinGetUpgradeFlags { return @() }
 $DryRun=$false; $AllowReinstall=$false
 $script:Failures=[Collections.Generic.List[string]]::new(); $script:Successes=[Collections.Generic.List[string]]::new(); $script:Skipped=[Collections.Generic.List[string]]::new()
@@ -41,11 +40,16 @@ function Invoke-WinGet {
     } else { $global:LASTEXITCODE=0 }
 }
 $ForceWinGetReinstall=$false
+$script:UpdaterConfig=[pscustomobject]@{SkipPackages=@()}
 foreach($mode in @($false,$true)) {
     $script:ThrowFirst=$mode
     $script:Attempts=[Collections.Generic.List[string]]::new()
     Update-WinGetApps
     if (($script:Attempts -join ',') -ne ($script:Expected -join ',')) { throw "No continuo todos los paquetes: $script:Attempts" }
 }
+$script:UpdaterConfig.SkipPackages=@('Microsoft.SQLServer.OLEDBDriver')
+$script:Attempts=[Collections.Generic.List[string]]::new()
+Update-WinGetApps
+if (($script:Attempts -join ',') -ne ($script:Expected[1..2] -join ',')) { throw 'No se respeto SkipPackages' }
 Write-Output 'PASS: IDs con +, continuidad tras codigo 1603/WinGet y excepcion, tres paquetes intentados.'
 

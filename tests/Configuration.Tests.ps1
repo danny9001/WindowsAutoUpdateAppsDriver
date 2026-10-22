@@ -1,0 +1,33 @@
+$ErrorActionPreference='Stop'
+$repo=Split-Path $PSScriptRoot -Parent
+$tokens=$null; $errors=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'UpdateAppsDrivers8.1.ps1'),[ref]$tokens,[ref]$errors)
+if($errors.Count){throw ($errors | Out-String)}
+foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Initialize-UpdaterConfiguration','Save-UpdaterConfiguration')},$true)) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+function Write-Info($msg) {}
+$testDirectory=Join-Path ([IO.Path]::GetTempPath()) ('updater-config-tests-'+[guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $testDirectory | Out-Null
+$script:UpdaterScriptPath=Join-Path $testDirectory 'UpdateAppsDrivers8.1.ps1'
+Initialize-UpdaterConfiguration
+if(-not (Test-Path -LiteralPath $script:UpdaterConfigPath) -or $script:UpdaterConfig.AskQuestions -or $script:UpdaterConfig.Schedule.Enabled){throw 'Valores predeterminados incorrectos'}
+$script:UpdaterConfig.SkipPackages=@('Microsoft.VCRedist.2015+.x64')
+$script:UpdaterConfig.SkipStore=$true
+$script:UpdaterConfig.Schedule.Enabled=$true
+$script:UpdaterConfig.Schedule.DayOfWeek='Friday'
+$script:UpdaterConfig.Schedule.Time='03:15'
+Save-UpdaterConfiguration
+Initialize-UpdaterConfiguration
+if($script:UpdaterConfig.SkipPackages[0] -ne 'Microsoft.VCRedist.2015+.x64' -or -not $script:UpdaterConfig.SkipStore -or $script:UpdaterConfig.Schedule.Time -ne '03:15'){throw 'No se conservaron las decisiones'}
+$validConfig=Get-Content -LiteralPath $script:UpdaterConfigPath -Raw
+foreach($invalid in @('{invalid json}', '{"AskQuestions":"false"}', '{"SkipPackages":"Test.App"}', '{"Schedule":{"Time":"25:00"}}', '{"Schedule":{"DayOfWeek":"monday"}}')) {
+    Set-Content -LiteralPath $script:UpdaterConfigPath -Value $invalid
+    $rejected=$false
+    try { Initialize-UpdaterConfiguration } catch {$rejected=$true}
+    if(-not $rejected){throw "Se acepto configuracion invalida: $invalid"}
+}
+Set-Content -LiteralPath $script:UpdaterConfigPath -Value $validConfig
+Initialize-UpdaterConfiguration
+'PASS: creacion de JSON, valores sin preguntas, persistencia y rechazo de configuracion invalida.'
+# Directorio temporal aislado conservado para diagnostico; nunca modifica tareas ni instaladores.

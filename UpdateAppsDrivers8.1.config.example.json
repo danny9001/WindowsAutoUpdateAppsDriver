@@ -1,0 +1,11 @@
+{
+  "AskQuestions": false,
+  "SkipStore": false,
+  "SkipPackages": [],
+  "InstallWinGetIfMissing": true,
+  "Schedule": {
+    "Enabled": false,
+    "DayOfWeek": "Sunday",
+    "Time": "22:00"
+  }
+}
