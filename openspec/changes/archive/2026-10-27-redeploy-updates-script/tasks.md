@@ -1,0 +1,4 @@
+- [x] Documentar propuesta y diseno.
+- [x] Aceptar la tarea propia existente y actualizar el script.
+- [x] Pruebas (pwsh y Windows PowerShell 5.1) y documentacion.
+- [x] Confirmacion y subida.

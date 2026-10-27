@@ -31,7 +31,7 @@ El instalador muestra estado por destino; los errores de un equipo no detienen l
 
 - Copia el actualizador a `C:\ProgramData\GenIT\UpdateAppsDrivers` y verifica el SHA-256. Si ya existia una copia, deja un respaldo con sufijo `.backup-...`.
 - Conserva `UpdateAppsDrivers8.1.config.json` si ya existe. Si no existe, crea uno sin preguntas ni tarea recurrente y con BIOS/firmware desactivado.
-- Registra `GenIT-UpdateAppsDrivers-Once-AAAAMMDD-HHMM` como SYSTEM, para una sola ejecucion en el horario local del destino. Si ya existe una tarea con ese nombre, no la reemplaza.
+- Registra `GenIT-UpdateAppsDrivers-Once-AAAAMMDD-HHMM` como SYSTEM, para una sola ejecucion en el horario local del destino. Si ya existe esa tarea de un despliegue anterior y no se esta ejecutando, actualiza el script (con respaldo y SHA-256) y conserva la tarea: el resultado dice `Actualizado`. Una tarea ajena con ese nombre o en ejecucion no se toca y se informa como error.
 - No inicia actualizaciones al desplegar. La tarea no elimina tareas antiguas del actualizador. Sus resultados se consultan en el Programador de tareas y en `C:\ProgramData\GenIT\UpdateAppsDrivers\Logs`.
 - El horario se interpreta en la zona horaria local de cada equipo; el resultado muestra zona y hora observada. Si el equipo esta apagado a esa hora, no se garantiza la ejecucion posterior.
 - En tareas SYSTEM, las aplicaciones instaladas solo para perfiles de usuario y Microsoft Store pueden quedar fuera. El instalador no configura WinRM, DNS, firewall, puertos o TrustedHosts.

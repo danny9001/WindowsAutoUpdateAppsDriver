@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $testRoot | Out-Null
 $source=Join-Path $root 'UpdateAppsDrivers8.1.ps1'
 $hash=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
 $credential=[pscredential]::new('example\admin',(ConvertTo-SecureString 'not-a-real-password' -AsPlainText -Force))
-$script:FakeTasks=@{}
+$script:FakeTasks=@{}; $script:Registrations=0
 function New-PSSession {param($ComputerName,$Credential,$Authentication,$ErrorAction) if($ComputerName -eq 'unreachable'){throw 'WinRM no disponible'}; return [pscustomobject]@{Name=$ComputerName} }
 function Remove-PSSession {param($Session,$ErrorAction)}
 function Invoke-Command {param($Session,$ErrorAction,$ArgumentList,$ScriptBlock) & $ScriptBlock @ArgumentList }
@@ -25,7 +25,7 @@ function New-ScheduledTaskAction {param($Execute,$Argument,$WorkingDirectory,$Er
 function New-ScheduledTaskTrigger {param([switch]$Once,$At,$ErrorAction) [pscustomobject]@{Once=$Once;At=$At} }
 function New-ScheduledTaskPrincipal {param($UserId,$LogonType,$RunLevel,$ErrorAction) [pscustomobject]@{UserId=$UserId;RunLevel=$RunLevel} }
 function New-ScheduledTaskSettingsSet {param($MultipleInstances,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$ExecutionTimeLimit,$ErrorAction) [pscustomobject]@{MultipleInstances=$MultipleInstances} }
-function Register-ScheduledTask {param($TaskName,$Action,$Trigger,$Principal,$Settings,$Description,$ErrorAction) $script:FakeTasks[$TaskName]=[pscustomobject]@{Action=$Action;Trigger=$Trigger;Principal=$Principal;Settings=$Settings} }
+function Register-ScheduledTask {param($TaskName,$Action,$Trigger,$Principal,$Settings,$Description,$ErrorAction) $script:FakeTasks[$TaskName]=[pscustomobject]@{Action=$Action;Actions=@([pscustomobject]@{Arguments=$Action.Argument});Description=$Description;State='Ready';Trigger=$Trigger;Principal=$Principal;Settings=$Settings}; $script:Registrations++ }
 $date=(Get-Date).AddDays(2)
 $date=[datetime]::ParseExact($date.ToString('yyyy-MM-dd HH:mm'),'yyyy-MM-dd HH:mm',[Globalization.CultureInfo]::InvariantCulture)
 $result=Invoke-UpdaterDeployment -Target 'PC01' -Date $date -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash
@@ -37,7 +37,14 @@ if((Get-FileHash -LiteralPath $result.Script -Algorithm SHA256).Hash -ne $hash){
 $config=Get-Content -LiteralPath (Join-Path $testRoot 'UpdateAppsDrivers8.1.config.json') -Raw | ConvertFrom-Json
 if($config.AskQuestions -or $config.Schedule.Enabled -or $config.Drivers.IncludeFirmware){throw 'Configuracion desatendida insegura'}
 $again=Invoke-UpdaterDeployment -Target 'PC01' -Date $date -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash
-if($again.Estado -ne 'Error' -or $again.Detalle -notmatch 'ya existe'){throw 'Se sobrescribio una tarea existente'}
+if($again.Estado -ne 'Actualizado' -or -not (Test-Path -LiteralPath $again.Respaldo) -or $script:Registrations -ne 1){throw "Despliegue repetido: no actualizo el script o registro otra tarea: $($again.Detalle)"}
+if((Get-FileHash -LiteralPath $again.Script -Algorithm SHA256).Hash -ne $hash){throw 'Despliegue repetido: copia incorrecta'}
+$script:FakeTasks[$result.Tarea].State='Running'
+$running=Invoke-UpdaterDeployment -Target 'PC01' -Date $date -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash
+if($running.Estado -ne 'Error' -or $running.Detalle -notmatch 'ejecutando'){throw 'Se actualizo durante una ejecucion'}
+$script:FakeTasks[$result.Tarea].State='Ready'; $script:FakeTasks[$result.Tarea].Description='Otra tarea'
+$foreign=Invoke-UpdaterDeployment -Target 'PC01' -Date $date -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash
+if($foreign.Estado -ne 'Error' -or $foreign.Detalle -notmatch 'no es de este despliegue'){throw 'Se acepto una tarea ajena'}
 $config.SkipPackages=@('Example.App')
 $config | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $testRoot 'UpdateAppsDrivers8.1.config.json') -Encoding UTF8
 $later=Invoke-UpdaterDeployment -Target 'PC01' -Date $date.AddMinutes(2) -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash
@@ -48,4 +55,4 @@ $offline=Invoke-UpdaterDeployment -Target 'unreachable' -Date $date -DomainCrede
 if($offline.Estado -ne 'Error'){throw 'No se reporto el equipo inaccesible'}
 $badHash=Invoke-UpdaterDeployment -Target 'PC02' -Date $date.AddMinutes(1) -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash ('0'*64)
 if($badHash.Estado -ne 'Error' -or $badHash.Detalle -notmatch 'SHA-256'){throw 'No se rechazo hash incorrecto'}
-'PASS: fechas, validacion, copia, hash, tarea unica SYSTEM, proteccion de tareas existentes y error WinRM; sin conexiones reales.'
+'PASS: fechas, validacion, copia, hash, tarea unica SYSTEM, actualizacion con tarea propia existente, proteccion de tareas ajenas o en ejecucion y error WinRM; sin conexiones reales.'
