@@ -1,0 +1,5 @@
+- [x] Documentar propuesta y diseno.
+- [x] Implementar Test-WinGetMsixPackage y la omision como SYSTEM.
+- [x] Pruebas (pwsh y 5.1) y verificacion con winget real.
+- [x] Confirmacion y subida.
+- [ ] Confirmar en LPZVMNPS00 que Windows Terminal queda en Omitidos.

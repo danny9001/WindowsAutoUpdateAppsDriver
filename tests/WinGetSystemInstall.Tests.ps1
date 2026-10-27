@@ -5,7 +5,7 @@ $file=Join-Path (Split-Path $PSScriptRoot -Parent) 'UpdateAppsDrivers8.1.ps1'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors | Out-String)}
-foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Install-WinGet','Install-VCRedist','Install-WinGetWithClientModule','Find-ProvisionedWinGet')},$true)){ . ([scriptblock]::Create($definition.Extent.Text)) }
+foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Install-WinGet','Install-VCRedist','Install-WinGetWithClientModule','Find-ProvisionedWinGet','Test-WinGetMsixPackage')},$true)){ . ([scriptblock]::Create($definition.Extent.Text)) }
 function Write-Info($msg) {}
 function Write-Ok($msg) {}
 function Write-Detail($msg) {}
@@ -63,4 +63,15 @@ try {
     if($found -notlike "*_1.29.380.0_${arch}__8wekyb3d8bbwe\winget.exe"){throw "WinGet aprovisionado incorrecto: $found"}
     if(Find-ProvisionedWinGet -Root (Join-Path $root 'no-existe')){throw 'Se encontro WinGet en una carpeta inexistente'}
 } finally { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
-'PASS: VC++ 1638, instalacion de WinGet como SYSTEM por aprovisionamiento, fallo por usuario no fatal, sin respaldo de cliente como SYSTEM y busqueda en WindowsApps.'
+# Tipo de instalador de winget show, en ingles o traducido.
+function Invoke-WinGet { $global:LASTEXITCODE=$script:ShowCode; $script:ShowOutput }
+$script:ShowCode=0
+$script:ShowOutput=@('Found Windows Terminal [Microsoft.WindowsTerminal]','Version: 1.25.2733.0','Installer:','  Installer Type: msix','  Installer Url: https://example.invalid/Terminal.msixbundle')
+if(-not (Test-WinGetMsixPackage -Id 'Microsoft.WindowsTerminal')){throw 'No se detecto msix'}
+$script:ShowOutput=@('Instalador:','  Tipo de instalador: appx')
+if(-not (Test-WinGetMsixPackage -Id 'X')){throw 'No se detecto appx con etiqueta traducida'}
+$script:ShowOutput=@('Installer:','  Installer Type: exe','  Installer Url: https://example.invalid/app.msix')
+if(Test-WinGetMsixPackage -Id 'X'){throw 'Un instalador exe se tomo como msix'}
+$script:ShowOutput=@('  Installer Type: msix'); $script:ShowCode=1
+if(Test-WinGetMsixPackage -Id 'X'){throw 'Un error de winget show se tomo como msix'}
+'PASS: VC++ 1638, instalacion de WinGet como SYSTEM por aprovisionamiento, fallo por usuario no fatal, sin respaldo de cliente como SYSTEM, busqueda en WindowsApps y deteccion de MSIX.'

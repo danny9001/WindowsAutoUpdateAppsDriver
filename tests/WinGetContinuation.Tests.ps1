@@ -32,6 +32,9 @@ function Test-Internet { param([switch]$VerboseMode) return $true }
 function Ensure-WinGetSources {}
 function Resolve-WinGetFailure { param($Id,$Details,$Operation) }
 function Get-WinGetUpgradesList { return $script:Lines }
+function Test-IsSystemAccount { return $script:IsSystem }
+function Test-WinGetMsixPackage { param($Id) $script:MsixChecks.Add($Id); return ($Id -eq $script:Expected[1]) }
+$script:IsSystem=$false; $script:MsixChecks=[Collections.Generic.List[string]]::new()
 function Invoke-WinGet {
     $id=$args[2]
     $script:Attempts.Add($id)
@@ -52,5 +55,13 @@ $script:UpdaterConfig.SkipPackages=@('Microsoft.SQLServer.OLEDBDriver')
 $script:Attempts=[Collections.Generic.List[string]]::new()
 Update-WinGetApps
 if (($script:Attempts -join ',') -ne ($script:Expected[1..2] -join ',')) { throw 'No se respeto SkipPackages' }
-Write-Output 'PASS: IDs con +, continuidad tras codigo 1603/WinGet y excepcion, tres paquetes intentados.'
+if ($script:MsixChecks.Count) { throw 'Se consulto el tipo de instalador fuera de SYSTEM' }
+
+# Como SYSTEM, los paquetes MSIX se omiten sin intentar la actualizacion; el resto continua.
+$script:IsSystem=$true; $script:UpdaterConfig.SkipPackages=@()
+$script:Attempts=[Collections.Generic.List[string]]::new(); $script:Skipped.Clear()
+Update-WinGetApps
+if (($script:Attempts -join ',') -ne (@($script:Expected[0],$script:Expected[2]) -join ',')) { throw "Se intento un paquete MSIX como SYSTEM: $script:Attempts" }
+if (-not ($script:Skipped -match [regex]::Escape($script:Expected[1]) + ': MSIX')) { throw 'El paquete MSIX no figura en Omitidos' }
+Write-Output 'PASS: IDs con +, continuidad tras codigo 1603/WinGet y excepcion, tres paquetes intentados, MSIX omitidos como SYSTEM.'
 

@@ -1133,6 +1133,19 @@ function Resolve-WinGetFailure {
     } catch { Write-WarnMsg "Error al reintentar ${Id}: $($_.Exception.Message). Comando manual: $manualCommand" }
 }
 
+# Tipo de instalador de WinGet para este equipo. La etiqueta se traduce segun el idioma, por eso se busca
+# una linea "<campo>: msix" o "<campo>: appx" en lugar de "Installer Type".
+function Test-WinGetMsixPackage {
+    param([Parameter(Mandatory=$true)][string]$Id)
+    try {
+        $output = @(Invoke-WinGet show --id $Id --exact --accept-source-agreements --disable-interactivity 2>&1 | ForEach-Object { [string]$_ })
+        if ($LASTEXITCODE -ne 0) { return $false }
+        return [bool]@($output | Where-Object { $_ -match '^\s*[^:]+:\s*(msix|appx)\s*$' }).Count
+    } catch {
+        return $false
+    }
+}
+
 function Update-WinGetApps {
     Write-Section 2 5 'Aplicaciones (WinGet)'
     if (-not (Test-WinGetInstalled) -or $ForceWinGetReinstall) {
@@ -1194,12 +1207,20 @@ function Update-WinGetApps {
         # Se actualiza paquete por paquete: si uno falla (p. ej. requiere --location),
         # 'winget upgrade --all' aborta todo el lote restante. Uno por uno, un fallo no bloquea al resto.
         $index = 0
+        $isSystem = Test-IsSystemAccount
         foreach ($item in $toInstall) {
             $index++
             $id = $item.Id
             $label = "  [{0}/{1}] {2} ({3} → {4})" -f $index, $toInstall.Count, $id, $item.Version, $item.Available
             Write-Host $label -NoNewline -ForegroundColor White
             Write-Host ' ... ' -NoNewline:(-not $script:DiagMode)
+            # Los paquetes MSIX se registran por usuario: SYSTEM no puede actualizarlos (0x80070002).
+            if ($isSystem -and (Test-WinGetMsixPackage -Id $id)) {
+                Write-Host 'OMITIDO' -ForegroundColor Cyan
+                Write-Detail 'Paquete MSIX: se actualiza en la sesion de cada usuario (Microsoft Store o WinGet), no como SYSTEM.'
+                $script:Skipped.Add("WinGet ${id}: MSIX, requiere sesion de usuario")
+                continue
+            }
             try {
                 $packageOutput = [Collections.Generic.List[string]]::new()
                 $wgArgs = @('upgrade','--id',$id,'--exact') + @(Get-WinGetUpgradeFlags) + @('--accept-package-agreements','--accept-source-agreements','--silent','--disable-interactivity')
