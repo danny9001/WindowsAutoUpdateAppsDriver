@@ -337,49 +337,72 @@ function Ensure-PowerShell7 {
     Write-WarnMsg "⚠️ Detectado Windows PowerShell $($PSVersionTable.PSVersion). Se recomienda PowerShell 7 o superior."
     if ($NoRelaunch) { return $false }
 
-    # Buscar pwsh.exe
-    $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
-    if (-not $pwshCmd) {
-        $candidate = Join-Path $Env:ProgramFiles 'PowerShell\7\pwsh.exe'
-        if (Test-Path $candidate) { $pwshCmd = $candidate }
-    }
-    if ($pwshCmd) {
-        Write-Info "🔁 Reejecutando este script en PowerShell 7..."
-        $argsToPass = @()
-        if ($PSBoundParameters.ContainsKey('NoRelaunch') -and $NoRelaunch) { $argsToPass += '-NoRelaunch' }
-        if ($SkipStore) { $argsToPass += '-SkipStore' }
-        if ($ForceWinGetReinstall) { $argsToPass += '-ForceWinGetReinstall' }
-        if ($ScheduledRun) { $argsToPass += '-ScheduledRun' }
-        if ($SkipScheduleTask) { $argsToPass += '-SkipScheduleTask' }
-        if ($SkipLegacyTaskMigration) { $argsToPass += '-SkipLegacyTaskMigration' }
-        if ($ReconfigureTask) { $argsToPass += '-ReconfigureTask' }
-        if ($IncludePinned) { $argsToPass += '-IncludePinned' }
-        if ($IncludeUnknown) { $argsToPass += '-IncludeUnknown' }
-        if ($AllowReinstall) { $argsToPass += '-AllowReinstall' }
-        if ($DryRun) { $argsToPass += '-DryRun' }
-        if ($script:VerboseRequested) { $argsToPass += '-Verbose' }
-        if ($ExcludeIds.Count -gt 0) { $argsToPass += @('-ExcludeIds',"`"$($ExcludeIds -join ',')`"") }
-        $argsToPass += @('-RebootPolicy',$RebootPolicy,'-LogRetentionDays',"$LogRetentionDays")
-        $argsToPass += @('-OutputFolder',"`"$OutputFolder`"")
-
-        # Cerrar el transcript de este proceso: el pwsh relanzado crea el suyo.
-        try { Stop-Transcript | Out-Null } catch {}
-        if ($PSCommandPath) {
-            $p = Start-Process -FilePath $pwshCmd -ArgumentList (@('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"") + $argsToPass) -Wait -PassThru
-            exit $p.ExitCode
-        } else {
-            Start-Process -FilePath $pwshCmd -ArgumentList @('-NoLogo','-NoProfile') -Wait
-        }
-        exit
-    } else {
+    $pwshPath = Find-PwshPath
+    if (-not $pwshPath) { return $false }
+    if (-not $script:UpdaterScriptPath) {
+        Write-WarnMsg "⚠️ No se conoce la ruta del script; no se puede relanzar en PowerShell 7."
         return $false
     }
+
+    Write-Info "🔁 Reejecutando este script en PowerShell 7 ($pwshPath)..."
+    $relaunchArgs = Get-PwshRelaunchArguments
+    Write-Diag "Relanzamiento: `"$pwshPath`" $($relaunchArgs -join ' ')"
+    # Cerrar el transcript de este proceso: el pwsh relanzado crea el suyo.
+    try { Stop-Transcript | Out-Null } catch {}
+    try {
+        # En la misma consola: la salida y el resumen quedan a la vista y se conserva el codigo de salida.
+        & $pwshPath @relaunchArgs
+    } catch {
+        try { Start-Transcript -Path $tsFile -Append -ErrorAction SilentlyContinue | Out-Null } catch {}
+        Write-WarnMsg "⚠️ No se pudo relanzar en PowerShell 7: $($_.Exception.Message)"
+        return $false
+    }
+    exit $LASTEXITCODE
+}
+
+# Ubica pwsh.exe aunque el PATH del proceso sea anterior a la instalacion de PowerShell 7.
+function Find-PwshPath {
+    try {
+        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if ($machinePath) { $env:Path = (@($machinePath, $userPath) | Where-Object { $_ }) -join ';' }
+    } catch {}
+    $command = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    # ProgramW6432 apunta a "Program Files" tambien desde un proceso de 32 bits.
+    foreach ($root in @($env:ProgramW6432, $env:ProgramFiles) | Where-Object { $_ } | Select-Object -Unique) {
+        $candidate = Join-Path $root 'PowerShell\7\pwsh.exe'
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    return $null
+}
+
+# Argumentos para relanzar el script con pwsh. Sin comillas incrustadas: el operador & cita los que tienen espacios.
+function Get-PwshRelaunchArguments {
+    $list = @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File',$script:UpdaterScriptPath)
+    if ($SkipStore) { $list += '-SkipStore' }
+    if ($ForceWinGetReinstall) { $list += '-ForceWinGetReinstall' }
+    if ($ScheduledRun) { $list += '-ScheduledRun' }
+    if ($SkipScheduleTask) { $list += '-SkipScheduleTask' }
+    if ($SkipLegacyTaskMigration) { $list += '-SkipLegacyTaskMigration' }
+    if ($ReconfigureTask) { $list += '-ReconfigureTask' }
+    if ($IncludePinned) { $list += '-IncludePinned' }
+    if ($IncludeUnknown) { $list += '-IncludeUnknown' }
+    if ($AllowReinstall) { $list += '-AllowReinstall' }
+    if ($DryRun) { $list += '-DryRun' }
+    if ($script:VerboseRequested) { $list += '-Verbose' }
+    if (@($ExcludeIds).Count -gt 0) { $list += @('-ExcludeIds', ($ExcludeIds -join ',')) }
+    # Windows PowerShell 5.1 no escapa la barra final de un argumento citado ("C:\Mis datos\" rompe la comilla).
+    $folder = "$OutputFolder"
+    if ($folder.EndsWith('\') -and $folder.Contains(' ')) { $folder += '.' }
+    $list += @('-RebootPolicy',$RebootPolicy,'-LogRetentionDays',"$LogRetentionDays",'-OutputFolder',$folder)
+    return ,$list
 }
 
 # Instalar PowerShell 7 (MSI estable) si hace falta y tenemos permiso
 function Install-PowerShell7 {
     if ($PSVersionTable.PSVersion.Major -ge 7) { return $true }
-    if (Get-Command pwsh -ErrorAction SilentlyContinue) { return $true }
+    if (Find-PwshPath) { return $true }
     if (-not (Test-IsAdmin)) { Write-ErrMsg "❌ Se requiere Admin para instalar PowerShell 7."; return $false }
 
     if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg "❌ Sin Internet para descargar PowerShell 7."; return $false }
@@ -426,13 +449,17 @@ function Install-PowerShell7 {
             throw 'El MSI descargado no tiene una firma valida de Microsoft.'
         }
         Write-Info "⚙️ Instalando PowerShell 7 (silencioso)..."
-        Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait
-        Start-Sleep -Seconds 3
-        if (Get-Command pwsh -ErrorAction SilentlyContinue) {
-            Write-Ok "✅ PowerShell 7 instalado."
+        $msi = Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -PassThru
+        Write-Diag "msiexec de PowerShell 7 termino con codigo $($msi.ExitCode)"
+        # 1641 y 3010: instalado, con reinicio iniciado o pendiente.
+        if ($msi.ExitCode -notin @(0, 1641, 3010)) { throw "msiexec termino con codigo $($msi.ExitCode)." }
+        # El PATH de este proceso es anterior a la instalacion; Find-PwshPath lo recarga del registro.
+        $pwshPath = Find-PwshPath
+        if ($pwshPath) {
+            Write-Ok "✅ PowerShell 7 instalado: $pwshPath"
             return $true
         } else {
-            Write-ErrMsg "❌ Instalación de PowerShell 7 no verificada."
+            Write-ErrMsg "❌ Instalación de PowerShell 7 no verificada: no se encontro pwsh.exe."
             return $false
         }
     } catch {
@@ -1896,8 +1923,10 @@ if ($needPwsh) {
     $relaunched = Ensure-PowerShell7 -NoRelaunch:$NoRelaunch
     if (-not $relaunched -and -not $NoRelaunch) {
         if (Install-PowerShell7) {
-            # Relanzar ahora que está instalado
-            Ensure-PowerShell7 | Out-Null
+            # Relanzar ahora que está instalado; si funciona, Ensure-PowerShell7 no vuelve.
+            if (-not (Ensure-PowerShell7)) {
+                Write-WarnMsg "⚠️ PowerShell 7 quedo instalado pero no se pudo relanzar: continuando en Windows PowerShell 5.1 (compatibilidad reducida)."
+            }
         } else {
             Write-WarnMsg "⚠️ Continuando en Windows PowerShell 5.1 (compatibilidad reducida)."
         }

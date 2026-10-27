@@ -1,0 +1,6 @@
+- [x] Documentar propuesta y diseno.
+- [x] Agregar Find-PwshPath y Get-PwshRelaunchArguments; relanzar en la misma consola.
+- [x] Revisar el codigo de msiexec y verificar con Find-PwshPath.
+- [x] Prueba PowerShell7Relaunch (en pwsh 7 y Windows PowerShell 5.1); todas las pruebas y sintaxis 5.1.
+- [x] Confirmacion y subida.
+- [ ] Prueba real en un equipo sin PowerShell 7 (tarea del despliegue remoto, que arranca en 5.1).
