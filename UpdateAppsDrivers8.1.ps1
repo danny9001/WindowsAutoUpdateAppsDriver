@@ -627,7 +627,8 @@ function Update-RuckZuckApps {
             $needsVerification = [Collections.Generic.List[object]]::new()
             foreach ($short in $pending) {
                 $index++
-                Write-Host ("    [{0}/{1}] {2} ... " -f $index, $pending.Count, $short) -NoNewline -ForegroundColor White
+                # En modo detallado se termina la linea para que las lineas [diag] no se mezclen con el resultado.
+                Write-Host ("    [{0}/{1}] {2} ... " -f $index, $pending.Count, $short) -NoNewline:(-not $script:DiagMode) -ForegroundColor White
                 try {
                     $result = Invoke-RuckZuckProcess -Executable $rzPath -Arguments (@('update',$short,'--retry') + $scopeArgs) -TimeoutSeconds $script:UpdaterConfig.RuckZuck.InstallTimeoutSeconds -LogLabel "update-$short"
                     $code = $result.ExitCode
@@ -644,7 +645,10 @@ function Update-RuckZuckApps {
                         Write-Host "FALLO O NO CONFIRMADO (código $code)" -ForegroundColor Red
                         @($result.Stdout + $result.Stderr) | Where-Object { $_ -match '\S' } | Select-Object -Last 3 | ForEach-Object { Write-Detail $_.Trim() }
                         Write-Detail "Logs completos: $($result.OutPath), $($result.ErrPath)"
-                        $script:Failures.Add("RuckZuck ${short}: codigo $code o instalacion no confirmada; log $($result.OutPath)")
+                        # La causa que informa RZGet (ERR/FTL o "Installation failed") es mas util en el resumen que el codigo 0.
+                        $reason = @($result.Stdout + $result.Stderr) | Where-Object { $_ -match '\[[^\]]*\s(ERR|FTL)\]|Installation failed' } | Select-Object -Last 1
+                        $reason = if ($reason) { ($reason -replace '^\s*\[[^\]]*\]\s*', '').Trim() } else { "codigo $code o instalacion no confirmada" }
+                        $script:Failures.Add("RuckZuck ${short}: $reason; log $($result.OutPath)")
                     }
                 } catch {
                     Write-Host 'ERROR' -ForegroundColor Red
@@ -1098,7 +1102,7 @@ function Update-WinGetApps {
             $id = $item.Id
             $label = "  [{0}/{1}] {2} ({3} → {4})" -f $index, $toInstall.Count, $id, $item.Version, $item.Available
             Write-Host $label -NoNewline -ForegroundColor White
-            Write-Host ' ... ' -NoNewline
+            Write-Host ' ... ' -NoNewline:(-not $script:DiagMode)
             try {
                 $packageOutput = [Collections.Generic.List[string]]::new()
                 $wgArgs = @('upgrade','--id',$id,'--exact') + @(Get-WinGetUpgradeFlags) + @('--accept-package-agreements','--accept-source-agreements','--silent','--disable-interactivity')
@@ -1366,7 +1370,7 @@ function Update-IntelDrivers {
             $script:Skipped.Add("Intel $($update.Name): sin instalacion silenciosa verificada")
             continue
         }
-        Write-Host "    $label ... " -NoNewline -ForegroundColor White
+        Write-Host "    $label ... " -NoNewline:(-not $script:DiagMode) -ForegroundColor White
         try { $result = Install-IntelDriverUpdate -Update $update } catch { $result = [pscustomobject]@{ Status='Failed'; Detail=$_.Exception.Message } }
         switch ($result.Status) {
             'Installed' { Write-Host 'OK' -ForegroundColor Green; $script:Successes.Add("Intel $($update.Name): $($result.Detail)") }
@@ -1604,6 +1608,12 @@ function Update-VendorDrivers {
     try { Write-DevicesWithoutDriver } catch { Write-WarnMsg "    ⚠️ No se pudo revisar dispositivos sin driver: $($_.Exception.Message)" }
 }
 
+function Get-UniqueWindowsUpdates {
+    # PSWindowsUpdate devuelve el mismo update en cada etapa (aceptar, descargar, instalar); se conserva el ultimo estado.
+    param([object[]]$Updates)
+    @($Updates | Where-Object { $_ } | Group-Object { "$($_.KB)|$($_.Title)" } | ForEach-Object { $_.Group[-1] })
+}
+
 function Update-WindowsDriversAndUpdates {
     Write-Section 5 5 'Windows Update (sistema y drivers)'
     if (-not (Test-IsAdmin)) { Write-WarnMsg "ℹ️ Ejecuta como Administrador para aplicar Windows Update sin restricciones."; }
@@ -1643,6 +1653,7 @@ function Update-WindowsDriversAndUpdates {
                 }
                 $wuResult = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot @wuFilter -ErrorAction Stop
             }
+            $wuResult = Get-UniqueWindowsUpdates -Updates $wuResult
             if ($wuResult) {
                 Write-WarnMsg ("📋 Actualizaciones procesadas: {0}" -f @($wuResult).Count)
                 ($wuResult | Format-Table KB, Status, Size, Title -AutoSize | Out-String -Width 200).TrimEnd().Split("`n") | Where-Object { $_.Trim() } |
@@ -1850,7 +1861,11 @@ function Write-DiagnosticContext {
     Write-Diag "Usuario: $([Security.Principal.WindowsIdentity]::GetCurrent().Name); admin: $(Test-IsAdmin); programado: $([bool]$ScheduledRun); DryRun: $([bool]$DryRun)"
     Write-Diag "OutputFolder: $OutputFolder; RebootPolicy: $RebootPolicy; politica de ejecucion: $(Get-ExecutionPolicy)"
     Write-Diag "Configuracion efectiva: $($script:UpdaterConfig | ConvertTo-Json -Depth 6 -Compress)"
-    try { Write-Diag "Proxy para https://www.microsoft.com: $([System.Net.WebRequest]::GetSystemWebProxy().GetProxy([uri]'https://www.microsoft.com'))" } catch {}
+    try {
+        $target = [uri]'https://www.microsoft.com'
+        $proxy = [System.Net.WebRequest]::GetSystemWebProxy().GetProxy($target)
+        Write-Diag "Proxy para ${target}: $(if (-not $proxy -or $proxy -eq $target) { 'sin proxy' } else { $proxy })"
+    } catch { Write-Diag "Proxy no disponible: $($_.Exception.Message)" }
     Write-Diag "NoDefaultCurrentDirectoryInExePath: $(if ($env:NoDefaultCurrentDirectoryInExePath) { 'activa (los SoftPaq de HP que llaman a HPUP.exe sin ruta fallan con 9009)' } else { 'no definida' })"
     if (-not (Get-PendingReboot)) { Write-Diag 'Sin reinicio pendiente al iniciar.' }
 }

@@ -63,6 +63,7 @@ Update-RuckZuckApps
 if(($script:Calls -join ',') -ne 'AppA,AppB'){throw 'No se respeto exclusion o continuidad'}
 if($script:Successes.Count -ne 1 -or $script:Successes[0] -notmatch 'AppA'){throw 'No se verifico AppA'}
 if($script:Failures.Count -ne 1 -or $script:Failures[0] -notmatch 'AppB'){throw 'Exit 0 de instalacion fallida fue marcado como exito'}
+if($script:Failures[0] -notmatch '^RuckZuck AppB: Installation failed: AppB; log '){throw "El resumen no incluye la causa de RZGet: $($script:Failures[0])"}
 if($script:Scans.Count -ne 2 -or $script:Scans[0] -notmatch '\|5$' -or $script:Scans[1] -notmatch '\|0$'){throw 'Numero de consultas o delay incorrectos'}
 Reset-Test; $script:TimeoutFirst=$true
 Update-RuckZuckApps

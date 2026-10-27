@@ -1,0 +1,6 @@
+- [x] Analizar la ejecucion -Verbose en LPZVMAD01 y documentar propuesta y diseno.
+- [x] Deduplicar Windows Update por KB y titulo (Get-UniqueWindowsUpdates).
+- [x] Incluir la causa de RZGet en el resumen de fallos.
+- [x] Terminar la linea de progreso en modo detallado (RuckZuck, WinGet, Intel); "sin proxy" en el contexto.
+- [x] Pruebas (10 PASS, sintaxis 5.1 sin errores); documentar exclusion de Npcap en CONFIGURACION.
+- [x] Confirmacion y subida.
