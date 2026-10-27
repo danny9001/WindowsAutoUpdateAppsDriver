@@ -3,7 +3,7 @@ $file=Join-Path (Split-Path $PSScriptRoot -Parent) 'UpdateAppsDrivers8.1.ps1'
 $tokens=$null; $errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
 if($errors.Count){throw ($errors | Out-String)}
-$names=@('Compare-DriverVersion','Get-IntelSilentArguments','Find-IntelDriverUpdates','Install-IntelDriverUpdate','Update-IntelDrivers','Get-HPImageAssistantRecommendations','Update-HPDrivers','Update-DellDrivers','Update-LenovoDrivers','Update-OemDrivers','Get-PciDeviceName','Get-DriverWorkFolder')
+$names=@('Update-VendorDrivers','Get-OemVendor','Compare-DriverVersion','Get-IntelSilentArguments','Find-IntelDriverUpdates','Install-IntelDriverUpdate','Update-IntelDrivers','Get-HPImageAssistantRecommendations','Update-HPDrivers','Update-DellDrivers','Update-LenovoDrivers','Update-OemDrivers','Get-PciDeviceName','Get-DriverWorkFolder')
 foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names},$true)){ . ([scriptblock]::Create($definition.Extent.Text)) }
 function Write-Info($msg) {}
 function Write-Ok($msg) {}
@@ -135,6 +135,29 @@ try {
     Reset-Lists
     Update-OemDrivers
     if($script:FirmwareRequested -or $script:Skipped.Count -ne 1){throw 'Se pidio firmware con bateria'}
+
+    # Fabricante: HPE (servidores) no es HP
+    Remove-Item Function:\Get-OemVendor
+    foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-OemVendor'},$true)){ . ([scriptblock]::Create($definition.Extent.Text)) }
+    function Get-CimInstance { param($ClassName,$ErrorAction) return [pscustomobject]@{Manufacturer=$script:Manufacturer} }
+    $expected=@{'HP'='HP'; 'Hewlett-Packard'='HP'; 'HPE'=$null; 'Dell Inc.'='Dell'; 'LENOVO'='Lenovo'; 'Microsoft Corporation'=$null}
+    foreach($pair in $expected.GetEnumerator()){ $script:Manufacturer=$pair.Key; if((Get-OemVendor) -ne $pair.Value){throw "Fabricante $($pair.Key) mal clasificado"} }
+    Remove-Item Function:\Get-CimInstance
+
+    # Windows Server: no se ejecutan herramientas de cliente ni el catalogo de Intel
+    function Write-Section { param($Number,$Total,$Title) }
+    function Test-IsAdmin { return $true }
+    function Test-Internet { param([switch]$VerboseMode) return $true }
+    function Update-OemDrivers { $script:VendorCalls.Add('Oem') }
+    function Update-IntelDrivers { $script:VendorCalls.Add('Intel') }
+    function Write-DevicesWithoutDriver { $script:VendorCalls.Add('Missing') }
+    $script:VendorCalls=[Collections.Generic.List[string]]::new()
+    function Get-IsServer { return $true }
+    Update-VendorDrivers
+    if($script:VendorCalls.Count){throw 'Se ejecutaron herramientas de cliente en Windows Server'}
+    function Get-IsServer { return $false }
+    Update-VendorDrivers
+    if(($script:VendorCalls -join ',') -ne 'Oem,Intel,Missing'){throw "Flujo de equipo cliente incorrecto: $($script:VendorCalls -join ',')"}
 
     # pci.ids: nombre de un dispositivo sin driver
     $script:PciIds=@('# comentario','8086  Intel Corporation','	7af0  Alder Lake-S PCH CNVi WiFi','	a7a1  Raptor Lake-P [Iris Xe Graphics]','8087  Intel Corp.')

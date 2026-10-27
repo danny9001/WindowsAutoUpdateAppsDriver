@@ -1354,7 +1354,8 @@ function Update-IntelDrivers {
 
 function Get-OemVendor {
     $manufacturer = "$((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer)"
-    if ($manufacturer -match '^(HP|Hewlett)') { return 'HP' }
+    # \b deja fuera a HPE (servidores ProLiant), que HP Image Assistant no admite.
+    if ($manufacturer -match '^(HP|Hewlett-Packard)\b') { return 'HP' }
     if ($manufacturer -match '^Dell') { return 'Dell' }
     if ($manufacturer -match '^Lenovo') { return 'Lenovo' }
     return $null
@@ -1441,7 +1442,11 @@ function Update-HPDrivers {
     switch ($install.ExitCode) {
         { $_ -in @(0,256,257) } { Write-Ok '    ✅ HP: actualizaciones instaladas.'; $script:Successes.Add("Drivers HP ($($analysis.Recommendations.Count))") }
         3010 { Write-WarnMsg '    ✅ HP: actualizaciones instaladas; requiere reinicio.'; $script:DriverRebootRequired = $true; $script:Successes.Add("Drivers HP ($($analysis.Recommendations.Count), reinicio pendiente)") }
-        default { throw "HP Image Assistant termino con codigo $($install.ExitCode); reporte: $($install.Report)" }
+        default {
+            # Los install.cmd de los SoftPaq llaman a HPUP.exe sin ruta: con esta variable de seguridad activa terminan con 9009.
+            $hint = if ($env:NoDefaultCurrentDirectoryInExePath) { ' NoDefaultCurrentDirectoryInExePath esta activa en este proceso y los SoftPaq que llaman a HPUP.exe sin ruta fallan con 9009; ejecute el script desde una consola sin esa variable.' } else { '' }
+            throw "HP Image Assistant termino con codigo $($install.ExitCode); reporte: $($install.Report).$hint"
+        }
     }
 }
 
@@ -1557,6 +1562,11 @@ function Update-VendorDrivers {
     Write-Section 4 5 'Drivers del fabricante e Intel'
     $sources = @($script:UpdaterConfig.Drivers.Sources)
     if (-not @($sources | Where-Object { $_ -in @('Oem','Intel') }).Count) { Write-Info '    Fuentes Oem e Intel desactivadas en la configuracion.'; return }
+    # HP Image Assistant, Dell Command | Update, LSUClient y el catalogo de Intel son para equipos cliente.
+    if (Get-IsServer) {
+        Write-Info '    Windows Server: los drivers se actualizan con Windows Update (paso 5); las herramientas de cliente no aplican a servidores.'
+        return
+    }
     if (-not (Test-IsAdmin)) {
         Write-WarnMsg '    ⚠️ Se requiere administrador para instalar drivers; se omite este paso.'
         $script:Skipped.Add('Drivers del fabricante e Intel: sin permisos de administrador')

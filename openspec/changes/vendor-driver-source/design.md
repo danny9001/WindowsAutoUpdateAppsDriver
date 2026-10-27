@@ -45,6 +45,8 @@ Fabricante del equipo (Win32_ComputerSystem):
 
 Intel: descargar el zip del catalogo, leer software-configurations.json, cruzar Components[].DetectionValues (tipo Default) con los hardware ID instalados y la version del sistema operativo (Files[].OperatingSystems). Para cada paquete mas nuevo: descargar de downloadmirror.intel.com, comprobar el SHA-1 del catalogo y exigir firma Authenticode valida de Intel (sin firma valida no se instala). Las entradas DetectionType Guid o Custom no se evaluan.
 
+Windows Server (ProductType distinto de 1, incluye controladores de dominio): el paso se omite y los drivers quedan a cargo de Windows Update. HP Image Assistant, Dell Command | Update y LSUClient solo admiten equipos cliente, y el catalogo de Intel ofrece drivers de cliente. El fabricante "HPE" (ProLiant) no se trata como HP. Las herramientas de servidor (HPE Service Pack for ProLiant, Dell System Update, Lenovo XClarity) quedan fuera de este cambio. Las maquinas virtuales no tienen fabricante compatible ni hardware Intel en el catalogo, asi que no instalan nada.
+
 DryRun solo analiza y lista en las tres fuentes. Los reportes y codigos de salida pasan al resumen y a Logs.
 
 ## Riesgos
