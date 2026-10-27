@@ -3,6 +3,7 @@
   "SkipStore": false,
   "SkipPackages": [],
   "InstallWinGetIfMissing": true,
+  "Verbose": false,
   "RuckZuck": {
     "SkipShortNames": [],
     "DelayDays": 0,

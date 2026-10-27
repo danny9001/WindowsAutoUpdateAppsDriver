@@ -37,6 +37,9 @@ At the end it prints a summary (successful / skipped / with problems / reboot pe
 
 # Do not ask about the scheduled task
 .\UpdateAppsDrivers8.1.ps1 -SkipScheduleTask
+
+# Detailed diagnostics: machine context, every external command with exit code and duration
+.\UpdateAppsDrivers8.1.ps1 -Verbose -DryRun
 ```
 
 ## Parameters
@@ -57,6 +60,7 @@ At the end it prints a summary (successful / skipped / with problems / reboot pe
 | `-ForceWinGetReinstall` | Reinstall WinGet even if available. |
 | `-NoRelaunch` | Do not relaunch in PowerShell 7. |
 | `-OutputFolder` | Folder for downloads and the `Logs` subfolder (default: script folder). |
+| `-Verbose` | Detailed mode for analysis and troubleshooting (`[diag]` lines, also in the log). Same as `"Verbose": true` in the JSON, which also applies to the scheduled task. |
 
 ## Scheduled task
 
@@ -121,6 +125,9 @@ Al final imprime un resumen (correctos / omitidos / con problemas / reinicio pen
 
 # No preguntar por la tarea programada
 .\UpdateAppsDrivers8.1.ps1 -SkipScheduleTask
+
+# Diagnóstico detallado: contexto del equipo, cada comando externo con código y duración
+.\UpdateAppsDrivers8.1.ps1 -Verbose -DryRun
 ```
 
 ## Parámetros
@@ -141,6 +148,7 @@ Al final imprime un resumen (correctos / omitidos / con problemas / reinicio pen
 | `-ForceWinGetReinstall` | Reinstala WinGet aunque ya esté disponible. |
 | `-NoRelaunch` | No relanzar en PowerShell 7. |
 | `-OutputFolder` | Carpeta de descargas y de la subcarpeta `Logs` (por defecto, la del script). |
+| `-Verbose` | Modo detallado para análisis y corrección (líneas `[diag]`, también en el log). Equivale a `"Verbose": true` en el JSON, que además aplica a la tarea programada. |
 
 ## Tarea programada
 

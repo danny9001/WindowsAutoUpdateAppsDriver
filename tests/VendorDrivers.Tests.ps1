@@ -6,6 +6,7 @@ if($errors.Count){throw ($errors | Out-String)}
 $names=@('Update-VendorDrivers','Get-OemVendor','Compare-DriverVersion','Get-IntelSilentArguments','Find-IntelDriverUpdates','Install-IntelDriverUpdate','Update-IntelDrivers','Get-HPImageAssistantRecommendations','Update-HPDrivers','Update-DellDrivers','Update-LenovoDrivers','Update-OemDrivers','Get-PciDeviceName','Get-DriverWorkFolder')
 foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $names},$true)){ . ([scriptblock]::Create($definition.Extent.Text)) }
 function Write-Info($msg) {}
+function Write-Diag($msg) {}
 function Write-Ok($msg) {}
 function Write-WarnMsg($msg) {}
 function Write-ErrMsg($msg) {}

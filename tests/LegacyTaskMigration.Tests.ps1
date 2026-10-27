@@ -5,6 +5,7 @@ $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]
 if($errors.Count){throw ($errors | Out-String)}
 foreach($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Get-LegacyUpdaterTasks','Get-LegacyTaskSchedule','Invoke-LegacyTaskMigration')},$true)){ . ([scriptblock]::Create($definition.Extent.Text)) }
 function Write-Info($msg) {}
+function Write-Diag($msg) {}
 function Write-Ok($msg) {}
 function Write-WarnMsg($msg) {}
 function Write-ErrMsg($msg) {}

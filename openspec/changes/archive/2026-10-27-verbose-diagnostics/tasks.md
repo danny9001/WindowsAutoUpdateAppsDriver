@@ -1,0 +1,6 @@
+- [x] Documentar propuesta y diseno.
+- [x] Activacion por -Verbose y por JSON; reenvio al relanzar en PowerShell 7.
+- [x] Write-Diag y contexto del equipo al inicio.
+- [x] Instrumentar ayudantes de procesos, descargas, reinicio, Intel y migracion de tareas.
+- [x] Pruebas (9 PASS); ejecucion real con -Verbose -DryRun en DIMA-DLANDIVAR1: 27 lineas [diag], 0 VERBOSE nativo, tambien en el transcript.
+- [x] Actualizar README y CONFIGURACION; confirmacion y subida.

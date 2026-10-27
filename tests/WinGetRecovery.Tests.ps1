@@ -6,6 +6,7 @@ if($errors.Count){throw ($errors | Out-String)}
 $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-WinGetFailure'},$true)
 . ([scriptblock]::Create($definition.Extent.Text))
 function Write-Info($msg) {}
+function Write-Diag($msg) {}
 $script:Failures=[Collections.Generic.List[string]]::new(); $script:Successes=[Collections.Generic.List[string]]::new()
 function Write-Ok($msg) {}
 function Write-WarnMsg($msg) {}

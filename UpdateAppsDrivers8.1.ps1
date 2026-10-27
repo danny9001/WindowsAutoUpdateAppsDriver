@@ -77,6 +77,11 @@ $script:Failures = [Collections.Generic.List[string]]::new()
 $script:Successes = [Collections.Generic.List[string]]::new()
 $script:Skipped = [Collections.Generic.List[string]]::new()
 $script:InternetCheckedAt = $null
+# Modo detallado: -Verbose o "Verbose": true en el JSON. Usa salida propia (Write-Diag) y silencia el
+# -Verbose nativo, que llenaria la salida con mensajes internos de Import-Module, Get-CimInstance, etc.
+$script:VerboseRequested = [bool]$PSBoundParameters['Verbose']
+$script:DiagMode = $script:VerboseRequested
+$VerbosePreference = 'SilentlyContinue'
 
 # -------------------------
 # Utilidades base y logging
@@ -87,6 +92,7 @@ function Write-Ok($msg)      { Write-Host $msg -ForegroundColor Green }
 function Write-WarnMsg($msg) { Write-Host $msg -ForegroundColor Yellow }
 function Write-ErrMsg($msg)  { Write-Host $msg -ForegroundColor Red }
 function Write-Detail($msg)  { Write-Host "    $msg" -ForegroundColor DarkGray }
+function Write-Diag($msg)    { if ($script:DiagMode) { Write-Host ("  [diag {0:HH:mm:ss}] {1}" -f (Get-Date), $msg) -ForegroundColor DarkGray } }
 function Write-Section {
     param([int]$Number, [int]$Total, [string]$Title)
     $text = " [$Number/$Total] $Title "
@@ -116,6 +122,7 @@ function Initialize-UpdaterConfiguration {
         SkipStore = $false
         SkipPackages = @()
         InstallWinGetIfMissing = $true
+        Verbose = $false
         Schedule = [pscustomobject]@{ Enabled=$false; DayOfWeek='Sunday'; Time='22:00' }
         RuckZuck = [pscustomobject]@{ SkipShortNames=@(); DelayDays=0; ScanTimeoutSeconds=180; InstallTimeoutSeconds=1800; VersionCheckDays=7 }
         Drivers = [pscustomobject]@{ Sources=@('Oem','Intel','WindowsUpdate'); IncludeFirmware=$true; InstallVendorTool=$true; SkipIntelIds=@(); InstallTimeoutSeconds=3600 }
@@ -124,7 +131,7 @@ function Initialize-UpdaterConfiguration {
         try {
             $data = Get-Content -LiteralPath $script:UpdaterConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($null -eq $data -or $data -isnot [pscustomobject]) { throw 'Se requiere un objeto JSON.' }
-            foreach ($name in @('AskQuestions','SkipStore','InstallWinGetIfMissing')) {
+            foreach ($name in @('AskQuestions','SkipStore','InstallWinGetIfMissing','Verbose')) {
                 if ($data.PSObject.Properties.Name -contains $name) {
                     if ($data.$name -isnot [bool]) { throw "$name debe ser true o false." }
                     $script:UpdaterConfig.$name = $data.$name
@@ -199,6 +206,7 @@ function Initialize-UpdaterConfiguration {
 # Leer antes de actualizar o crear tareas; un JSON invalido detiene la ejecucion.
 Initialize-UpdaterConfiguration
 if ($script:UpdaterConfig.SkipStore) { $SkipStore = $true }
+if ($script:UpdaterConfig.Verbose) { $script:DiagMode = $true }
 
 # Asegurar carpeta de trabajo
 if (-not (Test-Path $OutputFolder)) {
@@ -344,6 +352,7 @@ function Ensure-PowerShell7 {
         if ($IncludeUnknown) { $argsToPass += '-IncludeUnknown' }
         if ($AllowReinstall) { $argsToPass += '-AllowReinstall' }
         if ($DryRun) { $argsToPass += '-DryRun' }
+        if ($script:VerboseRequested) { $argsToPass += '-Verbose' }
         if ($ExcludeIds.Count -gt 0) { $argsToPass += @('-ExcludeIds',"`"$($ExcludeIds -join ',')`"") }
         $argsToPass += @('-RebootPolicy',$RebootPolicy,'-LogRetentionDays',"$LogRetentionDays")
         $argsToPass += @('-OutputFolder',"`"$OutputFolder`"")
@@ -547,11 +556,14 @@ function Invoke-RuckZuckProcess {
     $logBase = Join-Path $logDir (('{0:yyyyMMdd-HHmmss}-{1}-{2}' -f (Get-Date), $safeLabel, [guid]::NewGuid().ToString('N')))
     $outPath = "$logBase.stdout.log"; $errPath = "$logBase.stderr.log"
     $quotedArgs = @($Arguments | ForEach-Object { '"' + $_.Replace('"','\"') + '"' })
+    Write-Diag "Ejecutando: `"$Executable`" $($quotedArgs -join ' ')"
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $Executable -ArgumentList $quotedArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $outPath -RedirectStandardError $errPath -ErrorAction Stop
     $finished = $process.WaitForExit($TimeoutSeconds * 1000)
     if (-not $finished) {
         try { Stop-Process -Id $process.Id -Force -ErrorAction Stop; $process.WaitForExit() } catch { Write-WarnMsg "No se pudo detener RZGet ($($process.Id)): $($_.Exception.Message)" }
     }
+    Write-Diag ("RZGet {0} en {1:N1} s; salida: {2}" -f $(if ($finished) { "termino con codigo $($process.ExitCode)" } else { "supero $TimeoutSeconds s y se detuvo" }), $watch.Elapsed.TotalSeconds, $outPath)
     $stdout = if (Test-Path -LiteralPath $outPath) { @(Get-Content -LiteralPath $outPath -ErrorAction SilentlyContinue) } else { @() }
     $stderr = if (Test-Path -LiteralPath $errPath) { @(Get-Content -LiteralPath $errPath -ErrorAction SilentlyContinue) } else { @() }
     return [pscustomobject]@{ TimedOut=(-not $finished); ExitCode=$(if ($finished) { $process.ExitCode } else { $null }); Stdout=$stdout; Stderr=$stderr; OutPath=$outPath; ErrPath=$errPath }
@@ -675,7 +687,9 @@ function Invoke-Download {
     Set-Tls12Enable; Set-ProxyDefaults
     $params = @{ Uri=$Uri; OutFile=$OutFile; ErrorAction='Stop' }
     if ($PSVersionTable.PSVersion.Major -lt 7) { $params.UseBasicParsing = $true }
+    Write-Diag "Descargando $Uri -> $OutFile"
     Invoke-WebRequest @params | Out-Null
+    Write-Diag ("Descargados {0:N0} bytes" -f (Get-Item -LiteralPath $OutFile -ErrorAction SilentlyContinue).Length)
 }
 
 function Get-WindowsPowerShellPath {
@@ -695,6 +709,7 @@ function Invoke-WindowsPowerShellCommand {
     param([Parameter(Mandatory=$true)][string]$Command)
     $windowsPowerShell = Get-WindowsPowerShellPath
     if (-not $windowsPowerShell) { throw 'Windows PowerShell 5.1 no esta disponible.' }
+    Write-Diag "Windows PowerShell 5.1: $Command"
     $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
     $output = @(& $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedCommand 2>&1)
     if ($LASTEXITCODE -ne 0) {
@@ -737,7 +752,10 @@ function Invoke-WinGet {
     param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
     $executable = Get-WinGetExecutable
     if (-not $executable) { throw 'WinGet no esta instalado o no se encontro winget.exe.' }
+    Write-Diag "Ejecutando: `"$executable`" $($Arguments -join ' ')"
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     & $executable @Arguments
+    Write-Diag ("winget termino con codigo {0} en {1:N1} s" -f $LASTEXITCODE, $watch.Elapsed.TotalSeconds)
 }
 
 function Test-WinGetInstalled {
@@ -1205,11 +1223,15 @@ function Get-DriverWorkFolder {
 
 function Invoke-DriverProcess {
     param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds)
+    Write-Diag "Ejecutando: `"$FilePath`" $($Arguments -join ' ')"
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden -ErrorAction Stop
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { Write-WarnMsg "No se pudo detener $(Split-Path $FilePath -Leaf): $($_.Exception.Message)" }
+        Write-Diag ("{0} supero {1} s y se detuvo" -f (Split-Path $FilePath -Leaf), $TimeoutSeconds)
         return [pscustomobject]@{ TimedOut=$true; ExitCode=$null }
     }
+    Write-Diag ("{0} termino con codigo {1} en {2:N1} s" -f (Split-Path $FilePath -Leaf), $process.ExitCode, $watch.Elapsed.TotalSeconds)
     return [pscustomobject]@{ TimedOut=$false; ExitCode=$process.ExitCode }
 }
 
@@ -1280,7 +1302,9 @@ function Find-IntelDriverUpdates {
             if ($component.DetectionType -ne 'Default' -or -not $component.DetectionValues) { continue }
             foreach ($device in $Inventory) {
                 if (-not @($component.DetectionValues | Where-Object { $device.HardwareId -like "*$_*" }).Count) { continue }
-                if ((Compare-DriverVersion -Left $component.Version -Right $device.DriverVersion) -gt 0 -and -not $found.Contains($id)) {
+                $comparison = Compare-DriverVersion -Left $component.Version -Right $device.DriverVersion
+                Write-Diag ("Intel {0} '{1}': {2} instalado {3}, catalogo {4} -> {5}" -f $id, $entry.Name, $device.DeviceName, $device.DriverVersion, $component.Version, $(if ($null -eq $comparison) { 'no comparable' } elseif ($comparison -gt 0) { 'mas nuevo' } elseif ($comparison -eq 0) { 'igual' } else { 'mas antiguo, se omite' }))
+                if ($comparison -gt 0 -and -not $found.Contains($id)) {
                     $found[$id] = [pscustomobject]@{
                         Id=$id; Name=$entry.Name; Page=$entry.Url; Category=$component.Category
                         DriverVersion=$component.Version; InstalledVersion=$device.DriverVersion
@@ -1645,13 +1669,13 @@ function Update-WindowsDriversAndUpdates {
 # Chequeo de reinicio pendiente
 function Get-PendingReboot {
     # Algunos instaladores de drivers piden reinicio sin dejar estas claves.
-    if ($script:DriverRebootRequired) { return $true }
+    if ($script:DriverRebootRequired) { Write-Diag 'Reinicio pendiente: lo pidio un instalador de drivers.'; return $true }
     $keys = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
         'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations'
     )
-    foreach ($k in $keys) { if (Test-Path $k) { return $true } }
+    foreach ($k in $keys) { if (Test-Path $k) { Write-Diag "Reinicio pendiente: existe $k"; return $true } }
     return $false
 }
 
@@ -1781,6 +1805,8 @@ function Invoke-LegacyTaskMigration {
     # Crea (o conserva) la tarea de la 8.1, la verifica y despues elimina las tareas de versiones anteriores.
     if (-not (Test-IsAdmin)) { return }
     try { $legacy = @(Get-LegacyUpdaterTasks) } catch { Write-WarnMsg "No se pudieron revisar tareas anteriores: $($_.Exception.Message)"; return }
+    Write-Diag ("Tareas de versiones anteriores encontradas: {0}" -f $legacy.Count)
+    foreach ($task in $legacy) { Write-Diag ("  {0}{1}: {2}" -f $task.TaskPath, $task.TaskName, (($task.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join ' | ')) }
     if ($legacy.Count -eq 0) { return }
     Write-WarnMsg ("⚠️ Tareas de versiones anteriores del script: {0}" -f (($legacy | ForEach-Object { "$($_.TaskPath)$($_.TaskName)" }) -join ', '))
     try {
@@ -1808,6 +1834,27 @@ function Invoke-LegacyTaskMigration {
     }
 }
 
+function Write-DiagnosticContext {
+    # Contexto para comparar equipos y reproducir fallos; el SHA-256 identifica la version exacta del script.
+    if (-not $script:DiagMode) { return }
+    Write-Diag "Script: $($script:UpdaterScriptPath)"
+    try { Write-Diag "SHA-256 del script: $((Get-FileHash -LiteralPath $script:UpdaterScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash)" } catch { Write-Diag "SHA-256 del script no disponible: $($_.Exception.Message)" }
+    Write-Diag "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)), proceso de $(if ([Environment]::Is64BitProcess) { 64 } else { 32 }) bits"
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $ubr = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue).UBR
+        Write-Diag "Windows: $($os.Caption) $($os.Version).$ubr; servidor: $(Get-IsServer)"
+        $computer = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        Write-Diag "Equipo: $($computer.Manufacturer) $($computer.Model)"
+    } catch { Write-Diag "No se pudo leer el sistema: $($_.Exception.Message)" }
+    Write-Diag "Usuario: $([Security.Principal.WindowsIdentity]::GetCurrent().Name); admin: $(Test-IsAdmin); programado: $([bool]$ScheduledRun); DryRun: $([bool]$DryRun)"
+    Write-Diag "OutputFolder: $OutputFolder; RebootPolicy: $RebootPolicy; politica de ejecucion: $(Get-ExecutionPolicy)"
+    Write-Diag "Configuracion efectiva: $($script:UpdaterConfig | ConvertTo-Json -Depth 6 -Compress)"
+    try { Write-Diag "Proxy para https://www.microsoft.com: $([System.Net.WebRequest]::GetSystemWebProxy().GetProxy([uri]'https://www.microsoft.com'))" } catch {}
+    Write-Diag "NoDefaultCurrentDirectoryInExePath: $(if ($env:NoDefaultCurrentDirectoryInExePath) { 'activa (los SoftPaq de HP que llaman a HPUP.exe sin ruta fallan con 9009)' } else { 'no definida' })"
+    if (-not (Get-PendingReboot)) { Write-Diag 'Sin reinicio pendiente al iniciar.' }
+}
+
 # -------------------------
 # MAIN
 # -------------------------
@@ -1820,6 +1867,8 @@ Write-Host ("  PowerShell: {0}" -f $PSVersionTable.PSVersion)
 Write-Host ("  Admin:      {0}" -f $(if (Test-IsAdmin) { 'Sí' } else { 'No' }))
 Write-Host ("  Modo:       {0}" -f $(if ($DryRun) { 'DryRun (solo listar)' } elseif ($ScheduledRun) { 'Programado' } else { 'Manual' }))
 Write-Host ("  Carpeta log: {0}" -f $LogFolder)
+if ($script:DiagMode) { Write-Host '  Detalle:    activado (-Verbose o "Verbose": true en el JSON)' }
+Write-DiagnosticContext
 
 # Si PS < 7, relanzar o instalar automaticamente (salvo -NoRelaunch).
 $needPwsh = ($PSVersionTable.PSVersion.Major -lt 7)

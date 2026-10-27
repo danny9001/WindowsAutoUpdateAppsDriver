@@ -18,6 +18,7 @@ $script:Lines=@(
 $ids=@(Get-WinGetUpgradeIds -Lines $script:Lines)
 if (($ids -join ',') -ne ($script:Expected -join ',')) { throw "IDs incorrectos: $ids" }
 function Write-Info($msg) {}
+function Write-Diag($msg) {}
 function Write-Section { param($Number,$Total,$Title) }
 function Write-Detail($msg) {}
 function Get-WinGetUpgradeFlags { return @() }
