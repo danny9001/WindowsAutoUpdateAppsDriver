@@ -422,33 +422,41 @@ $Global:RZGetLatestUrl = 'https://github.com/rzander/ruckzuck/releases/latest/do
 function Download-RZGet {
     param([string]$DestinationFolder = $OutputFolder)
     $dest = Join-Path $DestinationFolder 'RZGet.exe'
+    # RZGet.exe.config acompaña al ejecutable: proxy con credenciales por defecto, bindingRedirects y log en %TEMP%.
+    $destConfig = "$dest.config"
     if ($DryRun) {
         if (Test-Path -LiteralPath $dest) { return $dest }
         throw 'DryRun no descarga RZGet; copie el ejecutable antes de consultar.'
     }
-    if ((Test-Path -LiteralPath $dest) -and ((Get-Item -LiteralPath $dest).LastWriteTime -gt (Get-Date).AddDays(-$script:UpdaterConfig.RuckZuck.VersionCheckDays))) { return $dest }
+    if ((Test-Path -LiteralPath $dest) -and (Test-Path -LiteralPath $destConfig) -and ((Get-Item -LiteralPath $dest).LastWriteTime -gt (Get-Date).AddDays(-$script:UpdaterConfig.RuckZuck.VersionCheckDays))) { return $dest }
     Set-Tls12Enable; Set-ProxyDefaults
-    $tmp = "$dest.$([guid]::NewGuid().ToString('N')).download"
+    $staged = [Collections.Generic.List[object]]::new()
     try {
         $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/rzander/ruckzuck/releases/latest' -Headers @{ 'User-Agent'='UpdateAppsDrivers8.1' } -ErrorAction Stop
-        $asset = $release.assets | Where-Object { $_.name -eq 'RZGet.exe' } | Select-Object -First 1
-        if (-not $asset -or $asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') { throw 'La version publicada no incluye un SHA-256 verificable para RZGet.exe.' }
-        $expectedHash = $Matches[1]
-        if ((Test-Path -LiteralPath $dest) -and (Get-FileHash -LiteralPath $dest -Algorithm SHA256 -ErrorAction Stop).Hash -eq $expectedHash) {
-            (Get-Item -LiteralPath $dest).LastWriteTime = Get-Date
-            Write-Info "RZGet $($release.tag_name) ya esta actualizado."
-            return $dest
+        # Se descargan y verifican ambos archivos antes de reemplazar alguno, para no mezclar versiones.
+        foreach ($target in @($dest, $destConfig)) {
+            $name = Split-Path -Leaf $target
+            $asset = $release.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+            if (-not $asset -or $asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') { throw "La version publicada no incluye un SHA-256 verificable para $name." }
+            $expectedHash = $Matches[1]
+            if ((Test-Path -LiteralPath $target) -and (Get-FileHash -LiteralPath $target -Algorithm SHA256 -ErrorAction Stop).Hash -eq $expectedHash) { continue }
+            $tmp = "$target.$([guid]::NewGuid().ToString('N')).download"
+            $staged.Add([pscustomobject]@{ Name=$name; Tmp=$tmp; Target=$target })
+            Write-Info "📥 Descargando $name $($release.tag_name) y comprobando SHA-256..."
+            $iwrParams = @{ Uri = $asset.browser_download_url; OutFile = $tmp; ErrorAction='Stop' }
+            if ($PSVersionTable.PSVersion.Major -lt 7) { $iwrParams.UseBasicParsing = $true }
+            Invoke-WebRequest @iwrParams
+            if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256 -ErrorAction Stop).Hash -ne $expectedHash) { throw "SHA-256 de $name no coincide con el publicado por GitHub." }
         }
-        Write-Info "📥 Descargando RZGet $($release.tag_name) y comprobando SHA-256..."
-        $iwrParams = @{ Uri = $asset.browser_download_url; OutFile = $tmp; ErrorAction='Stop' }
-        if ($PSVersionTable.PSVersion.Major -lt 7) { $iwrParams.UseBasicParsing = $true }
-        Invoke-WebRequest @iwrParams
-        if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256 -ErrorAction Stop).Hash -ne $expectedHash) { throw 'SHA-256 de RZGet no coincide con el publicado por GitHub.' }
-        Test-DownloadSignature -Path $tmp -WarnOnly | Out-Null
-        Move-Item -LiteralPath $tmp -Destination $dest -Force -ErrorAction Stop
-        Write-Ok "✅ RZGet.exe descargado en: $dest"
+        if ($staged.Count -eq 0) { Write-Info "RZGet $($release.tag_name) ya esta actualizado." }
+        foreach ($file in $staged) {
+            if ($file.Target -eq $dest) { Test-DownloadSignature -Path $file.Tmp -WarnOnly | Out-Null }
+            Move-Item -LiteralPath $file.Tmp -Destination $file.Target -Force -ErrorAction Stop
+            Write-Ok "✅ $($file.Name) descargado en: $($file.Target)"
+        }
+        (Get-Item -LiteralPath $dest).LastWriteTime = Get-Date
     } catch {
-        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        foreach ($file in $staged) { Remove-Item -LiteralPath $file.Tmp -Force -ErrorAction SilentlyContinue }
         if (-not (Test-Path -LiteralPath $dest)) { throw }
         Write-WarnMsg "⚠️ No se pudo verificar o refrescar RZGet; se usa la copia existente: $($_.Exception.Message)"
     }

@@ -1,0 +1,4 @@
+- [x] Comparar script local con main y preservar configuracion personal.
+- [x] Documentar cambio y riesgo de reemplazo parcial.
+- [x] Ejecutar cinco pruebas existentes y verificar igualdad SHA-256 con script local.
+- [x] Preparar confirmacion y subida del cambio.
