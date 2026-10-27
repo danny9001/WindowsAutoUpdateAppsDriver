@@ -16,12 +16,13 @@
 
 ## What it does
 
-The run is organised in four numbered steps:
+The run is organised in five numbered steps:
 
 1. **RuckZuck (RZGet)** – checks the *machine* and *user* scopes separately and updates each app one by one.
 2. **WinGet** – lists pending upgrades in a table, then upgrades package by package (one failure never blocks the rest). Installs WinGet automatically if missing (LTSC/Server included).
 3. **Microsoft Store** – `wsreset` + `winget upgrade --source msstore`. Skipped on Windows Server and in scheduled runs.
-4. **Windows Update** – patches and drivers through the `PSWindowsUpdate` module.
+4. **Manufacturer and Intel drivers** – the computer maker's official tool (HP Image Assistant, Dell Command | Update, Lenovo LSUClient) for drivers, BIOS and firmware, then newer Intel drivers from the Intel Driver & Support Assistant catalog (SHA-1 and Intel signature checked, installed only if newer). Devices without a driver are named from pci.ids. See `CONFIGURACION-8.1.md`.
+5. **Windows Update** – patches and drivers through the `PSWindowsUpdate` module.
 
 At the end it prints a summary (successful / skipped / with problems / reboot pending) and exits with code `1` if anything failed, so the Task Scheduler shows the real status.
 
@@ -99,12 +100,13 @@ Earlier versions (7.1, 7.2, 8, Silence) and scripts replaced by 8.1 (`CreateTask
 
 ## Qué hace
 
-La ejecución se organiza en cuatro pasos numerados:
+La ejecución se organiza en cinco pasos numerados:
 
 1. **RuckZuck (RZGet)** – revisa por separado los ámbitos *máquina* y *usuario* y actualiza cada app una por una.
 2. **WinGet** – muestra los pendientes en una tabla y actualiza paquete por paquete (un fallo no bloquea al resto). Instala WinGet automáticamente si falta (incluye LTSC/Server).
 3. **Microsoft Store** – `wsreset` + `winget upgrade --source msstore`. Se omite en Windows Server y en ejecuciones programadas.
-4. **Windows Update** – parches y drivers mediante el módulo `PSWindowsUpdate`.
+4. **Drivers del fabricante e Intel** – la herramienta oficial del fabricante del equipo (HP Image Assistant, Dell Command | Update, Lenovo LSUClient) para drivers, BIOS y firmware, y luego los drivers más nuevos de Intel desde el catálogo de Intel Driver & Support Assistant (con SHA-1 y firma de Intel verificados, solo si son más nuevos). Los dispositivos sin driver se nombran con pci.ids. Ver `CONFIGURACION-8.1.md`.
+5. **Windows Update** – parches y drivers mediante el módulo `PSWindowsUpdate`.
 
 Al final imprime un resumen (correctos / omitidos / con problemas / reinicio pendiente) y termina con código `1` si algo falló, de modo que el Programador de tareas muestra el estado real.
 

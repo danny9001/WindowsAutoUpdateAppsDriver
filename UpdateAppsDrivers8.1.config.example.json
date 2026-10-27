@@ -10,6 +10,13 @@
     "InstallTimeoutSeconds": 1800,
     "VersionCheckDays": 7
   },
+  "Drivers": {
+    "Sources": ["Oem", "Intel", "WindowsUpdate"],
+    "IncludeFirmware": true,
+    "InstallVendorTool": true,
+    "SkipIntelIds": [],
+    "InstallTimeoutSeconds": 3600
+  },
   "Schedule": {
     "Enabled": false,
     "DayOfWeek": "Sunday",

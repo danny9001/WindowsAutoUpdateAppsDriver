@@ -1,0 +1,10 @@
+- [x] Investigar fuentes de drivers e identificacion; documentar propuesta y diseno.
+- [x] Confirmar alcance con el usuario (todas las fuentes, firmware incluido, sin Catalogo de Microsoft).
+- [x] Decidir instalacion silenciosa de paquetes Intel: instalar en silencio con opciones verificadas (graficos -s; Wi-Fi WiX Burn y Bluetooth /quiet /norestart, comprobados en los instaladores 24.70.0).
+- [x] Agregar seccion Drivers al JSON, al ejemplo y a su validacion.
+- [x] Implementar fabricante del equipo: HP Image Assistant, Dell Command Update y Lenovo, con BIOS/firmware, BitLocker y corriente alterna.
+- [x] Implementar fuente Intel desde el catalogo de DSA con hash y firma.
+- [x] Nombres de dispositivos sin driver desde pci.ids en el resumen.
+- [x] Agregar pruebas simuladas; probar analisis real en HP (DryRun: HPIA detecto Intel DTT 9.0.11701 -> 9.0.11911; Intel al dia); ejecutar todas las pruebas.
+- [x] Actualizar README y CONFIGURACION; preparar confirmacion y subida.
+- [ ] Instalacion real en el equipo (requiere confirmacion del usuario). Dell y Lenovo solo probados con simulaciones.

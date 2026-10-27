@@ -118,6 +118,7 @@ function Initialize-UpdaterConfiguration {
         InstallWinGetIfMissing = $true
         Schedule = [pscustomobject]@{ Enabled=$false; DayOfWeek='Sunday'; Time='22:00' }
         RuckZuck = [pscustomobject]@{ SkipShortNames=@(); DelayDays=0; ScanTimeoutSeconds=180; InstallTimeoutSeconds=1800; VersionCheckDays=7 }
+        Drivers = [pscustomobject]@{ Sources=@('Oem','Intel','WindowsUpdate'); IncludeFirmware=$true; InstallVendorTool=$true; SkipIntelIds=@(); InstallTimeoutSeconds=3600 }
     }
     if (Test-Path -LiteralPath $script:UpdaterConfigPath) {
         try {
@@ -157,6 +158,31 @@ function Initialize-UpdaterConfiguration {
                         if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt $setting[1] -or $value -gt $setting[2]) { throw "RuckZuck.$name debe ser un entero entre $($setting[1]) y $($setting[2])." }
                         $script:UpdaterConfig.RuckZuck.$name = [int]$value
                     }
+                }
+            }
+            if ($data.PSObject.Properties.Name -contains 'Drivers') {
+                $drivers = $data.Drivers
+                if ($drivers -isnot [pscustomobject]) { throw 'Drivers debe ser un objeto JSON.' }
+                if ($drivers.PSObject.Properties.Name -contains 'Sources') {
+                    if ($drivers.Sources -isnot [array]) { throw 'Drivers.Sources debe ser un arreglo.' }
+                    foreach ($source in $drivers.Sources) { if ($source -cnotin @('Oem','Intel','WindowsUpdate')) { throw "Drivers.Sources solo admite Oem, Intel y WindowsUpdate: $source" } }
+                    $script:UpdaterConfig.Drivers.Sources = @($drivers.Sources | Select-Object -Unique)
+                }
+                foreach ($name in @('IncludeFirmware','InstallVendorTool')) {
+                    if ($drivers.PSObject.Properties.Name -contains $name) {
+                        if ($drivers.$name -isnot [bool]) { throw "Drivers.$name debe ser true o false." }
+                        $script:UpdaterConfig.Drivers.$name = $drivers.$name
+                    }
+                }
+                if ($drivers.PSObject.Properties.Name -contains 'SkipIntelIds') {
+                    if ($drivers.SkipIntelIds -isnot [array]) { throw 'Drivers.SkipIntelIds debe ser un arreglo.' }
+                    foreach ($id in $drivers.SkipIntelIds) { if ("$id" -notmatch '^\d+$') { throw "ID de Intel omitido invalido: $id" } }
+                    $script:UpdaterConfig.Drivers.SkipIntelIds = @($drivers.SkipIntelIds | ForEach-Object { "$_" } | Select-Object -Unique)
+                }
+                if ($drivers.PSObject.Properties.Name -contains 'InstallTimeoutSeconds') {
+                    $value = $drivers.InstallTimeoutSeconds
+                    if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt 60 -or $value -gt 14400) { throw 'Drivers.InstallTimeoutSeconds debe ser un entero entre 60 y 14400.' }
+                    $script:UpdaterConfig.Drivers.InstallTimeoutSeconds = [int]$value
                 }
             }
             $schedule = $script:UpdaterConfig.Schedule
@@ -548,7 +574,7 @@ function Get-RuckZuckPending {
 }
 
 function Update-RuckZuckApps {
-    Write-Section 1 4 'Aplicaciones (RuckZuck)'
+    Write-Section 1 5 'Aplicaciones (RuckZuck)'
     if (-not (Test-Internet -VerboseMode)) {
         Write-ErrMsg "❌ Sin Internet. Omitiendo RZGet."
         return
@@ -990,7 +1016,7 @@ function Resolve-WinGetFailure {
 }
 
 function Update-WinGetApps {
-    Write-Section 2 4 'Aplicaciones (WinGet)'
+    Write-Section 2 5 'Aplicaciones (WinGet)'
     if (-not (Test-WinGetInstalled) -or $ForceWinGetReinstall) {
         Write-WarnMsg "WinGet no esta disponible o se solicito reinstalacion."
         $installApproved = $ForceWinGetReinstall -or (Confirm-WinGetInstallation)
@@ -1114,7 +1140,7 @@ function Update-WinGetApps {
 # Microsoft Store
 # -------------------------
 function Update-MicrosoftStore {
-    Write-Section 3 4 'Microsoft Store'
+    Write-Section 3 5 'Microsoft Store'
     if ($SkipStore) { Write-WarnMsg "ℹ️ Se solicitó omitir Microsoft Store."; return }
     if ($DryRun) { Write-WarnMsg "ℹ️ DryRun: se omite Microsoft Store."; return }
     if ($ScheduledRun) { Write-WarnMsg "ℹ️ Ejecución programada (SYSTEM, sin sesión de usuario): se omite Microsoft Store."; return }
@@ -1165,8 +1191,387 @@ function Ensure-NuGetProvider {
     }
 }
 
+# -------------------------
+# Drivers del fabricante del equipo (HP, Dell, Lenovo) e Intel
+# -------------------------
+$script:DriverRebootRequired = $false
+
+function Get-DriverWorkFolder {
+    param([string]$Name)
+    $folder = Join-Path (Join-Path $OutputFolder 'Drivers') $Name
+    New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null
+    return $folder
+}
+
+function Invoke-DriverProcess {
+    param([string]$FilePath, [string[]]$Arguments, [int]$TimeoutSeconds)
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden -ErrorAction Stop
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { Write-WarnMsg "No se pudo detener $(Split-Path $FilePath -Leaf): $($_.Exception.Message)" }
+        return [pscustomobject]@{ TimedOut=$true; ExitCode=$null }
+    }
+    return [pscustomobject]@{ TimedOut=$false; ExitCode=$process.ExitCode }
+}
+
+function Get-InstalledDriverInventory {
+    @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.HardwareID -and $_.DriverVersion } |
+        ForEach-Object { [pscustomobject]@{ DeviceName=$_.DeviceName; HardwareId=$_.HardwareID; DriverVersion=$_.DriverVersion } })
+}
+
+function Compare-DriverVersion {
+    # Devuelve >0 si Left es mayor que Right; $null si alguna version no es comparable.
+    param([string]$Left, [string]$Right)
+    $a = $null; $b = $null
+    if (-not [version]::TryParse($Left, [ref]$a) -or -not [version]::TryParse($Right, [ref]$b)) { return $null }
+    return $a.CompareTo($b)
+}
+
+function Get-WindowsOsKey {
+    # Formato del catalogo de Intel, por ejemplo windows-11-25h2-64.
+    $current = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+    $release = if ($current.DisplayVersion) { $current.DisplayVersion } else { $current.ReleaseId }
+    $major = if ([Environment]::OSVersion.Version.Build -ge 22000) { '11' } else { '10' }
+    $bits = if ([Environment]::Is64BitOperatingSystem) { '64' } else { '32' }
+    return ('windows-{0}-{1}-{2}' -f $major, "$release".ToLower(), $bits)
+}
+
+function Get-IntelSilentArguments {
+    # Opciones silenciosas documentadas por Intel; /norestart evita el reinicio automatico de Wi-Fi y Bluetooth.
+    param([object]$Entry, [string]$Category)
+    $catalogOptions = @("$($Entry.InstallOptions)" -split '\s+' | Where-Object { $_ })
+    if ($Entry.AllowSilentInstallation -and $catalogOptions.Count) { return $catalogOptions }
+    switch ($Category) {
+        'Graphics'  { return @('-s') + $catalogOptions }
+        'Wireless'  { return @('/quiet','/norestart') }
+        'Bluetooth' { return @('/quiet','/norestart') }
+    }
+    return $null
+}
+
+function Get-IntelDriverCatalog {
+    # Catalogo publico que usa Intel Driver & Support Assistant; se renueva una vez al dia.
+    $folder = Get-DriverWorkFolder 'Intel'
+    $zip = Join-Path $folder 'data-en.zip'
+    if (-not (Test-Path -LiteralPath $zip) -or (Get-Item -LiteralPath $zip).LastWriteTime -lt (Get-Date).AddDays(-1)) {
+        $tmp = "$zip.$([guid]::NewGuid().ToString('N')).download"
+        try {
+            Invoke-Download -Uri 'https://dsadata.intel.com/data/en' -OutFile $tmp
+            Move-Item -LiteralPath $tmp -Destination $zip -Force -ErrorAction Stop
+        } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    $extract = Join-Path $folder 'catalog'
+    Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force -ErrorAction Stop
+    $file = Join-Path $extract 'software-configurations.json'
+    if (-not (Test-Path -LiteralPath $file)) { throw 'El catalogo de Intel no incluye software-configurations.json; puede haber cambiado su formato.' }
+    return @(Get-Content -LiteralPath $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Find-IntelDriverUpdates {
+    # Solo paquetes cuya version de driver supera la instalada: nunca se degrada lo que puso el fabricante del equipo.
+    param([object[]]$Catalog, [object[]]$Inventory, [string]$OsKey, [string[]]$SkipIds = @())
+    $found = [ordered]@{}
+    foreach ($entry in $Catalog) {
+        $id = "$($entry.Id)"
+        if ($id -in $SkipIds -or $found.Contains($id)) { continue }
+        $file = @($entry.Files | Where-Object { $OsKey -in $_.OperatingSystems }) | Select-Object -First 1
+        if (-not $file) { continue }
+        foreach ($component in @($entry.Components)) {
+            if ($component.DetectionType -ne 'Default' -or -not $component.DetectionValues) { continue }
+            foreach ($device in $Inventory) {
+                if (-not @($component.DetectionValues | Where-Object { $device.HardwareId -like "*$_*" }).Count) { continue }
+                if ((Compare-DriverVersion -Left $component.Version -Right $device.DriverVersion) -gt 0 -and -not $found.Contains($id)) {
+                    $found[$id] = [pscustomobject]@{
+                        Id=$id; Name=$entry.Name; Page=$entry.Url; Category=$component.Category
+                        DriverVersion=$component.Version; InstalledVersion=$device.DriverVersion
+                        Device=$device.DeviceName; HardwareId=$device.HardwareId; File=$file
+                        Arguments=(Get-IntelSilentArguments -Entry $entry -Category $component.Category)
+                    }
+                }
+            }
+        }
+    }
+    return @($found.Values)
+}
+
+function Install-IntelDriverUpdate {
+    param([object]$Update)
+    $folder = Get-DriverWorkFolder 'Intel'
+    $installer = Join-Path $folder (Split-Path $Update.File.Url -Leaf)
+    if (-not (Test-Path -LiteralPath $installer) -or (Get-FileHash -LiteralPath $installer -Algorithm SHA1).Hash -ne $Update.File.Hash) {
+        $tmp = "$installer.$([guid]::NewGuid().ToString('N')).download"
+        try {
+            Invoke-Download -Uri $Update.File.Url -OutFile $tmp
+            if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA1).Hash -ne $Update.File.Hash) { throw 'el SHA-1 no coincide con el catalogo de Intel' }
+            Move-Item -LiteralPath $tmp -Destination $installer -Force -ErrorAction Stop
+        } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not (Test-DownloadSignature -Path $installer -Publisher 'Intel Corporation')) { throw 'el instalador no tiene una firma valida de Intel Corporation' }
+    $result = Invoke-DriverProcess -FilePath $installer -Arguments $Update.Arguments -TimeoutSeconds $script:UpdaterConfig.Drivers.InstallTimeoutSeconds
+    if ($result.TimedOut) { return [pscustomobject]@{ Status='Failed'; Detail='tiempo agotado' } }
+    # Exito solo si el driver del dispositivo alcanza la version del catalogo, como en RuckZuck.
+    $device = @(Get-InstalledDriverInventory | Where-Object { $_.HardwareId -eq $Update.HardwareId }) | Select-Object -First 1
+    $confirmed = $device -and (Compare-DriverVersion -Left $device.DriverVersion -Right $Update.DriverVersion) -ge 0
+    if ($confirmed) {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{ Status='Installed'; Detail="version $($device.DriverVersion)" }
+    }
+    if ($result.ExitCode -in @(3010,1641)) {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{ Status='RebootRequired'; Detail='se aplica al reiniciar' }
+    }
+    return [pscustomobject]@{ Status='Failed'; Detail="codigo $($result.ExitCode) sin cambio de version" }
+}
+
+function Update-IntelDrivers {
+    Write-Detail 'Intel: consultando el catalogo de Intel Driver & Support Assistant...'
+    try {
+        $updates = @(Find-IntelDriverUpdates -Catalog (Get-IntelDriverCatalog) -Inventory (Get-InstalledDriverInventory) -OsKey (Get-WindowsOsKey) -SkipIds $script:UpdaterConfig.Drivers.SkipIntelIds)
+    } catch {
+        $script:Failures.Add("Drivers Intel: $($_.Exception.Message)")
+        Write-ErrMsg "    ❌ Catalogo de Intel: $($_.Exception.Message)"
+        return
+    }
+    if ($updates.Count -eq 0) { Write-Ok '    ✅ Intel: los drivers detectados estan al dia.'; return }
+    Write-WarnMsg ("    📋 Intel: actualizaciones disponibles: {0}" -f $updates.Count)
+    foreach ($update in $updates) {
+        $label = "$($update.Name) ($($update.InstalledVersion) → $($update.DriverVersion))"
+        if ($DryRun) { Write-Host "      • $label" -ForegroundColor White; continue }
+        if (-not $update.Arguments) {
+            Write-WarnMsg "    ⚠️ ${label}: sin instalacion silenciosa verificada; descargar en $($update.Page)"
+            $script:Skipped.Add("Intel $($update.Name): sin instalacion silenciosa verificada")
+            continue
+        }
+        Write-Host "    $label ... " -NoNewline -ForegroundColor White
+        try { $result = Install-IntelDriverUpdate -Update $update } catch { $result = [pscustomobject]@{ Status='Failed'; Detail=$_.Exception.Message } }
+        switch ($result.Status) {
+            'Installed' { Write-Host 'OK' -ForegroundColor Green; $script:Successes.Add("Intel $($update.Name): $($result.Detail)") }
+            'RebootRequired' { Write-Host 'REINICIO PENDIENTE' -ForegroundColor Yellow; $script:DriverRebootRequired = $true; $script:Successes.Add("Intel $($update.Name): $($result.Detail)") }
+            default { Write-Host 'FALLO' -ForegroundColor Red; Write-Detail $result.Detail; $script:Failures.Add("Intel $($update.Name): $($result.Detail)") }
+        }
+    }
+}
+
+function Get-OemVendor {
+    $manufacturer = "$((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer)"
+    if ($manufacturer -match '^(HP|Hewlett)') { return 'HP' }
+    if ($manufacturer -match '^Dell') { return 'Dell' }
+    if ($manufacturer -match '^Lenovo') { return 'Lenovo' }
+    return $null
+}
+
+function Test-OnAcPower {
+    # BatteryStatus 1 = descargando; un equipo sin bateria se considera conectado.
+    return -not @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Where-Object { $_.BatteryStatus -eq 1 }).Count
+}
+
+function Suspend-BitLockerForFirmware {
+    # WMI en lugar de Get-BitLockerVolume: funciona en pwsh 7 y no depende del idioma de manage-bde.
+    $volume = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction SilentlyContinue
+    if (-not $volume -or $volume.ProtectionStatus -ne 1) { return }
+    $result = Invoke-CimMethod -InputObject $volume -MethodName DisableKeyProtectors -Arguments @{ DisableCount = [uint32]1 } -ErrorAction Stop
+    if ($result.ReturnValue -ne 0) { throw "no se pudo suspender BitLocker (codigo $($result.ReturnValue))" }
+    Write-WarnMsg '    🔓 BitLocker suspendido hasta el proximo reinicio para actualizar BIOS/firmware.'
+}
+
+function Get-HPImageAssistant {
+    # Se descarga con WinGet (verifica SHA-256) y se extrae en Drivers\HPIA; no se instala en el sistema.
+    $folder = Get-DriverWorkFolder 'HPIA'
+    $tool = Join-Path $folder 'tool'
+    $stamp = Join-Path $folder 'descargado.txt'
+    $exe = Get-ChildItem -LiteralPath $tool -Filter 'HPImageAssistant.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    $fresh = (Test-Path -LiteralPath $stamp) -and (Get-Item -LiteralPath $stamp).LastWriteTime -gt (Get-Date).AddDays(-30)
+    if ($exe -and ($fresh -or $DryRun -or -not $script:UpdaterConfig.Drivers.InstallVendorTool)) { return $exe.FullName }
+    if ($DryRun -or -not $script:UpdaterConfig.Drivers.InstallVendorTool) { return $null }
+    $download = Join-Path $folder 'descarga'
+    Remove-Item -LiteralPath $download -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Detail 'HP: descargando HP Image Assistant con WinGet...'
+    Invoke-WinGet download --id HP.ImageAssistant --exact --source winget --download-directory $download --accept-source-agreements --accept-package-agreements | Out-Null
+    $installer = Get-ChildItem -LiteralPath $download -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $installer) { throw "WinGet no descargo HP Image Assistant (codigo $LASTEXITCODE)." }
+    if (-not (Test-DownloadSignature -Path $installer.FullName -Publisher 'HP Inc.')) { throw 'HP Image Assistant no tiene una firma valida de HP Inc.' }
+    Remove-Item -LiteralPath $tool -Recurse -Force -ErrorAction SilentlyContinue
+    # Los SoftPaq de HP terminan con 1168 al solo extraer; se valida por el ejecutable resultante.
+    Invoke-DriverProcess -FilePath $installer.FullName -Arguments @('/s','/e','/f',"`"$tool`"") -TimeoutSeconds 600 | Out-Null
+    $exe = Get-ChildItem -LiteralPath $tool -Filter 'HPImageAssistant.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $exe) { throw 'No se pudo extraer HP Image Assistant.' }
+    Set-Content -LiteralPath $stamp -Value (Get-Date -Format s)
+    Remove-Item -LiteralPath $download -Recurse -Force -ErrorAction SilentlyContinue
+    return $exe.FullName
+}
+
+function Get-HPImageAssistantRecommendations {
+    param([string]$ReportFolder)
+    $xmlFile = Get-ChildItem -LiteralPath $ReportFolder -Filter '*.xml' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $xmlFile) { return @() }
+    [xml]$xml = Get-Content -LiteralPath $xmlFile.FullName -Raw -ErrorAction Stop
+    foreach ($category in @('Drivers','BIOS','Firmware')) {
+        foreach ($item in @($xml.HPIA.Recommendations.$category.Recommendation)) {
+            if (-not $item) { continue }
+            [pscustomobject]@{ Category=$category; Component=$item.TargetComponent; Installed=$item.TargetVersion; Available=$item.ReferenceVersion; SoftPaq=$item.Solution.Softpaq.Id; Name=$item.Solution.Softpaq.Name }
+        }
+    }
+}
+
+function Invoke-HPImageAssistant {
+    param([string]$Executable, [string[]]$Categories, [ValidateSet('List','Install')][string]$Action)
+    $report = Join-Path (Join-Path $LogFolder 'HPIA') ('{0:yyyyMMdd-HHmmss}-{1}' -f (Get-Date), $Action)
+    New-Item -ItemType Directory -Path $report -Force -ErrorAction Stop | Out-Null
+    $softpaqs = Get-DriverWorkFolder 'HPIA\softpaqs'
+    $arguments = @('/Operation:Analyze', "/Category:$($Categories -join ',')", '/Selection:All', "/Action:$Action", '/Silent', '/Noninteractive', "/ReportFolder:`"$report`"", "/SoftpaqDownloadFolder:`"$softpaqs`"")
+    $result = Invoke-DriverProcess -FilePath $Executable -Arguments $arguments -TimeoutSeconds $script:UpdaterConfig.Drivers.InstallTimeoutSeconds
+    return [pscustomobject]@{ TimedOut=$result.TimedOut; ExitCode=$result.ExitCode; Report=$report; Recommendations=@(Get-HPImageAssistantRecommendations -ReportFolder $report) }
+}
+
+function Update-HPDrivers {
+    param([bool]$Firmware)
+    $exe = Get-HPImageAssistant
+    if (-not $exe) { Write-Info '    HP Image Assistant no esta disponible (DryRun o InstallVendorTool=false); se omite.'; $script:Skipped.Add('Drivers HP: sin HP Image Assistant'); return }
+    $categories = @('Drivers') + $(if ($Firmware) { @('BIOS','Firmware') } else { @() })
+    # HPIA: 0 correcto, 256/257 sin recomendaciones, 3010 requiere reinicio; el resto es fallo.
+    $analysis = Invoke-HPImageAssistant -Executable $exe -Categories $categories -Action List
+    if ($analysis.TimedOut -or $analysis.ExitCode -notin @(0,256,257)) { throw "analisis de HP Image Assistant fallo (codigo $($analysis.ExitCode)); reporte: $($analysis.Report)" }
+    if ($analysis.Recommendations.Count -eq 0) { Write-Ok '    ✅ HP: drivers, BIOS y firmware al dia.'; return }
+    Write-WarnMsg ("    📋 HP: actualizaciones disponibles: {0}" -f $analysis.Recommendations.Count)
+    $analysis.Recommendations | ForEach-Object { Write-Host ("      • [{0}] {1} ({2} → {3}) {4}" -f $_.Category, $_.Name, $_.Installed, $_.Available, $_.SoftPaq) -ForegroundColor White }
+    if ($DryRun) { return }
+    if (@($analysis.Recommendations | Where-Object { $_.Category -ne 'Drivers' }).Count) { Suspend-BitLockerForFirmware }
+    $install = Invoke-HPImageAssistant -Executable $exe -Categories $categories -Action Install
+    if ($install.TimedOut) { throw "HP Image Assistant supero el tiempo limite; reporte: $($install.Report)" }
+    switch ($install.ExitCode) {
+        { $_ -in @(0,256,257) } { Write-Ok '    ✅ HP: actualizaciones instaladas.'; $script:Successes.Add("Drivers HP ($($analysis.Recommendations.Count))") }
+        3010 { Write-WarnMsg '    ✅ HP: actualizaciones instaladas; requiere reinicio.'; $script:DriverRebootRequired = $true; $script:Successes.Add("Drivers HP ($($analysis.Recommendations.Count), reinicio pendiente)") }
+        default { throw "HP Image Assistant termino con codigo $($install.ExitCode); reporte: $($install.Report)" }
+    }
+}
+
+function Get-DellCommandUpdateCli {
+    $paths = @("$env:ProgramFiles\Dell\CommandUpdate\dcu-cli.exe", "${env:ProgramFiles(x86)}\Dell\CommandUpdate\dcu-cli.exe")
+    $found = $paths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if ($found -or $DryRun -or -not $script:UpdaterConfig.Drivers.InstallVendorTool) { return $found }
+    Write-Detail 'Dell: instalando Dell Command | Update con WinGet...'
+    Invoke-WinGet install --id Dell.CommandUpdate --exact --silent --source winget --accept-source-agreements --accept-package-agreements | Out-Null
+    return ($paths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+}
+
+function Update-DellDrivers {
+    param([bool]$Firmware)
+    $cli = Get-DellCommandUpdateCli
+    if (-not $cli) { Write-Info '    Dell Command | Update no esta disponible; se omite.'; $script:Skipped.Add('Drivers Dell: sin Dell Command | Update'); return }
+    $types = (@('driver') + $(if ($Firmware) { @('bios','firmware') } else { @() })) -join ','
+    $log = Join-Path $LogFolder ('DellCommandUpdate-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
+    $arguments = if ($DryRun) { @('/scan', "-updateType=$types", "-outputLog=`"$log`"") } else { @('/applyUpdates', "-updateType=$types", '-reboot=disable', '-autoSuspendBitLocker=enable', "-outputLog=`"$log`"") }
+    $result = Invoke-DriverProcess -FilePath $cli -Arguments $arguments -TimeoutSeconds $script:UpdaterConfig.Drivers.InstallTimeoutSeconds
+    if ($result.TimedOut) { throw "Dell Command | Update supero el tiempo limite; log: $log" }
+    # dcu-cli: 0 correcto, 1 requiere reinicio, 5 reinicio previo pendiente, 500 sin actualizaciones.
+    switch ($result.ExitCode) {
+        0 { Write-Ok "    ✅ Dell: proceso completado. Log: $log"; if (-not $DryRun) { $script:Successes.Add('Drivers Dell') } }
+        1 { Write-WarnMsg '    ✅ Dell: actualizaciones instaladas; requiere reinicio.'; $script:DriverRebootRequired = $true; $script:Successes.Add('Drivers Dell (reinicio pendiente)') }
+        5 { Write-WarnMsg '    ⚠️ Dell: hay un reinicio pendiente de una actualizacion anterior.'; $script:DriverRebootRequired = $true; $script:Skipped.Add('Drivers Dell: reinicio pendiente antes de continuar') }
+        500 { Write-Ok '    ✅ Dell: drivers, BIOS y firmware al dia.' }
+        default { throw "Dell Command | Update termino con codigo $($result.ExitCode); log: $log" }
+    }
+}
+
+function Update-LenovoDrivers {
+    param([bool]$Firmware)
+    if (-not (Get-Module -ListAvailable -Name LSUClient)) {
+        if ($DryRun -or -not $script:UpdaterConfig.Drivers.InstallVendorTool) { Write-Info '    Modulo LSUClient no disponible; se omite.'; $script:Skipped.Add('Drivers Lenovo: sin LSUClient'); return }
+        Ensure-NuGetProvider
+        Write-Detail 'Lenovo: instalando el modulo LSUClient...'
+        Install-Module LSUClient -Scope $(if (Test-IsAdmin) { 'AllUsers' } else { 'CurrentUser' }) -Force -ErrorAction Stop
+    }
+    Import-Module LSUClient -ErrorAction Stop
+    $types = @('Driver') + $(if ($Firmware) { @('BIOS','Firmware') } else { @() })
+    $updates = @(Get-LSUpdate -ErrorAction Stop | Where-Object { "$($_.Type)" -in $types -and $_.Installer.Unattended })
+    if ($updates.Count -eq 0) { Write-Ok '    ✅ Lenovo: drivers, BIOS y firmware al dia.'; return }
+    Write-WarnMsg ("    📋 Lenovo: actualizaciones disponibles: {0}" -f $updates.Count)
+    $updates | ForEach-Object { Write-Host ("      • [{0}] {1} {2}" -f $_.Type, $_.Title, $_.Version) -ForegroundColor White }
+    if ($DryRun) { return }
+    if (@($updates | Where-Object { "$($_.Type)" -ne 'Driver' }).Count) { Suspend-BitLockerForFirmware }
+    $results = @($updates | Install-LSUpdate -ErrorAction Stop)
+    $failed = @($results | Where-Object { -not $_.Success })
+    if (@($results | Where-Object { "$($_.PendingAction)" -match 'REBOOT|SHUTDOWN' }).Count) { $script:DriverRebootRequired = $true }
+    if ($failed.Count) { throw "Lenovo: fallaron $($failed.Count) de $($results.Count) actualizaciones: $(($failed | ForEach-Object { $_.Title }) -join ', ')" }
+    Write-Ok "    ✅ Lenovo: $($results.Count) actualizaciones instaladas."
+    $script:Successes.Add("Drivers Lenovo ($($results.Count))")
+}
+
+function Update-OemDrivers {
+    $vendor = Get-OemVendor
+    if (-not $vendor) {
+        Write-Info '    El fabricante del equipo no es HP, Dell ni Lenovo; se omite su herramienta.'
+        return
+    }
+    $firmware = $script:UpdaterConfig.Drivers.IncludeFirmware
+    if ($firmware -and -not (Test-OnAcPower)) {
+        Write-WarnMsg '    ⚠️ Equipo con bateria: se omiten BIOS y firmware; conecte el cargador para incluirlos.'
+        $script:Skipped.Add("BIOS/firmware ${vendor}: equipo sin corriente alterna")
+        $firmware = $false
+    }
+    Write-Detail "Fabricante del equipo: $vendor$(if ($firmware) { ' (drivers, BIOS y firmware)' } else { ' (drivers)' })"
+    switch ($vendor) {
+        'HP' { Update-HPDrivers -Firmware $firmware }
+        'Dell' { Update-DellDrivers -Firmware $firmware }
+        'Lenovo' { Update-LenovoDrivers -Firmware $firmware }
+    }
+}
+
+function Get-PciDeviceName {
+    # pci.ids (pciutils, GPL-2+/BSD-3) solo nombra dispositivos; no aporta drivers.
+    param([string]$HardwareId)
+    if ($HardwareId -notmatch 'VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})') { return $null }
+    $vendorId = $Matches[1].ToLower(); $deviceId = $Matches[2].ToLower()
+    if (-not $script:PciIds) {
+        $file = Join-Path (Get-DriverWorkFolder 'pci') 'pci.ids'
+        if (-not (Test-Path -LiteralPath $file) -or (Get-Item -LiteralPath $file).LastWriteTime -lt (Get-Date).AddDays(-30)) {
+            Invoke-Download -Uri 'https://raw.githubusercontent.com/pciutils/pciids/master/pci.ids' -OutFile $file
+        }
+        $script:PciIds = Get-Content -LiteralPath $file -ErrorAction Stop
+    }
+    $vendorName = $null
+    foreach ($line in $script:PciIds) {
+        if ($null -eq $vendorName) {
+            if ($line -match "^$vendorId\s+(.+)$") { $vendorName = $Matches[1] }
+        } elseif ($line -match "^\t$deviceId\s+(.+)$") {
+            return "$vendorName $($Matches[1])"
+        } elseif ($line -match '^[0-9a-f]{4}\s') { break }
+    }
+    return $vendorName
+}
+
+function Write-DevicesWithoutDriver {
+    # Codigo 28: el dispositivo no tiene driver instalado. Solo se informa.
+    $missing = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $_.ConfigManagerErrorCode -eq 28 })
+    foreach ($device in $missing) {
+        $hardwareId = @($device.HardwareID)[0]
+        $name = $null
+        try { $name = Get-PciDeviceName -HardwareId $hardwareId } catch { Write-Detail "pci.ids no disponible: $($_.Exception.Message)" }
+        if (-not $name) { $name = $device.Name }
+        Write-WarnMsg "    ⚠️ Sin driver: $name ($hardwareId)"
+        $script:Skipped.Add("Sin driver: $name ($hardwareId)")
+    }
+}
+
+function Update-VendorDrivers {
+    Write-Section 4 5 'Drivers del fabricante e Intel'
+    $sources = @($script:UpdaterConfig.Drivers.Sources)
+    if (-not @($sources | Where-Object { $_ -in @('Oem','Intel') }).Count) { Write-Info '    Fuentes Oem e Intel desactivadas en la configuracion.'; return }
+    if (-not (Test-IsAdmin)) {
+        Write-WarnMsg '    ⚠️ Se requiere administrador para instalar drivers; se omite este paso.'
+        $script:Skipped.Add('Drivers del fabricante e Intel: sin permisos de administrador')
+        return
+    }
+    if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg '    ❌ Sin Internet. Omitiendo drivers del fabricante e Intel.'; return }
+    if ($sources -contains 'Oem') {
+        try { Update-OemDrivers } catch { $script:Failures.Add("Drivers del fabricante: $($_.Exception.Message)"); Write-ErrMsg "    ❌ Fabricante del equipo: $($_.Exception.Message)" }
+    }
+    if ($sources -contains 'Intel') { Update-IntelDrivers }
+    try { Write-DevicesWithoutDriver } catch { Write-WarnMsg "    ⚠️ No se pudo revisar dispositivos sin driver: $($_.Exception.Message)" }
+}
+
 function Update-WindowsDriversAndUpdates {
-    Write-Section 4 4 'Windows Update (sistema y drivers)'
+    Write-Section 5 5 'Windows Update (sistema y drivers)'
     if (-not (Test-IsAdmin)) { Write-WarnMsg "ℹ️ Ejecuta como Administrador para aplicar Windows Update sin restricciones."; }
     if (-not (Test-Internet -VerboseMode)) { Write-ErrMsg "❌ Sin Internet. Abortando Windows Update."; return }
 
@@ -1180,15 +1585,21 @@ function Update-WindowsDriversAndUpdates {
             Install-Module PSWindowsUpdate -Scope $moduleScope -Force -AllowClobber -ErrorAction Stop
         }
         Import-Module PSWindowsUpdate -ErrorAction Stop
+        # Sin la fuente WindowsUpdate en Drivers.Sources, Windows Update solo aplica parches del sistema.
+        $wuFilter = @{}
+        if ($script:UpdaterConfig.Drivers.Sources -notcontains 'WindowsUpdate') {
+            $wuFilter.NotCategory = 'Drivers'
+            Write-Detail 'Drivers excluidos de Windows Update por configuracion.'
+        }
 
         if ($DryRun) {
             Write-Info "🔍 DryRun: actualizaciones de Windows pendientes (no se instalan)..."
-            Get-WindowsUpdate -MicrosoftUpdate | Format-Table -AutoSize | Out-String | Write-Host
+            Get-WindowsUpdate -MicrosoftUpdate @wuFilter | Format-Table -AutoSize | Out-String | Write-Host
         } else {
             Write-Detail "Buscando e instalando actualizaciones..."
             $wuResult = $null
             try {
-                $wuResult = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot -ErrorAction Stop
+                $wuResult = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot @wuFilter -ErrorAction Stop
             } catch {
                 # Solo si falla se reinician los servicios y se reintenta una vez.
                 Write-WarnMsg "⚠️ Falló Windows Update ($($_.Exception.Message)); reinicio servicios y reintento una vez..."
@@ -1196,7 +1607,7 @@ function Update-WindowsDriversAndUpdates {
                     try { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue; Start-Service -Name $s -ErrorAction Stop }
                     catch { Write-WarnMsg ("⚠️ No se pudo reiniciar {0}: {1}" -f $s, $_.Exception.Message) }
                 }
-                $wuResult = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot -ErrorAction Stop
+                $wuResult = Get-WindowsUpdate -MicrosoftUpdate -AcceptAll -Install -IgnoreReboot @wuFilter -ErrorAction Stop
             }
             if ($wuResult) {
                 Write-WarnMsg ("📋 Actualizaciones procesadas: {0}" -f @($wuResult).Count)
@@ -1223,6 +1634,8 @@ function Update-WindowsDriversAndUpdates {
 
 # Chequeo de reinicio pendiente
 function Get-PendingReboot {
+    # Algunos instaladores de drivers piden reinicio sin dejar estas claves.
+    if ($script:DriverRebootRequired) { return $true }
     $keys = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired',
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
@@ -1351,6 +1764,7 @@ Configure-UpdaterScheduledTask
 Update-RuckZuckApps
 Update-WinGetApps
 Update-MicrosoftStore
+Update-VendorDrivers
 Update-WindowsDriversAndUpdates
 
 # Resumen final
