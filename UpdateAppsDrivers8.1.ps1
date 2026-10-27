@@ -334,7 +334,10 @@ function Ensure-PowerShell7 {
     param([switch]$NoRelaunch)
     if ($PSVersionTable.PSVersion.Major -ge 7) { return $true }
 
-    Write-WarnMsg "⚠️ Detectado Windows PowerShell $($PSVersionTable.PSVersion). Se recomienda PowerShell 7 o superior."
+    if (-not $script:Ps5Warned) {
+        Write-WarnMsg "⚠️ Detectado Windows PowerShell $($PSVersionTable.PSVersion). Se recomienda PowerShell 7 o superior."
+        $script:Ps5Warned = $true
+    }
     if ($NoRelaunch) { return $false }
 
     $pwshPath = Find-PwshPath
@@ -784,13 +787,17 @@ function Get-WinGetExecutable {
     # Server/SYSTEM no siempre tienen el alias de WindowsApps; usar la ubicacion real del paquete.
     $packageLocation = $null
     if (Get-Command Get-AppxPackage -ErrorAction SilentlyContinue) {
-        $package = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue |
-            Sort-Object Version -Descending | Select-Object -First 1
-        if ($package) { $packageLocation = $package.InstallLocation }
-    } elseif (Test-AppxDeploymentAvailable) {
+        # En pwsh 7 de Server 2022 el modulo Appx no carga ("Operation is not supported on this platform").
+        try {
+            $package = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction Stop |
+                Sort-Object Version -Descending | Select-Object -First 1
+            if ($package) { $packageLocation = $package.InstallLocation }
+        } catch { Write-Diag "Get-AppxPackage no disponible en este PowerShell: $($_.Exception.Message)" }
+    }
+    if (-not $packageLocation -and (Test-AppxDeploymentAvailable)) {
         # Los cmdlets AppX suelen estar disponibles solo en Windows PowerShell 5.1, no en pwsh.
         $windowsPowerShell = Get-WindowsPowerShellPath
-        $packageLocation = & $windowsPowerShell -NoProfile -NonInteractive -Command "(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).InstallLocation" 2>$null | Select-Object -First 1
+        $packageLocation = & $windowsPowerShell -NoProfile -NonInteractive -Command "(Get-AppxPackage -Name Microsoft.DesktopAppInstaller -AllUsers -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1).InstallLocation" 2>$null | Select-Object -First 1
     }
     if ($packageLocation) {
         $candidate = Join-Path $packageLocation 'winget.exe'
@@ -799,7 +806,31 @@ function Get-WinGetExecutable {
             return $script:WinGetExecutable
         }
     }
+    # Paquete aprovisionado que aun no esta registrado para ningun usuario (tipico tras instalarlo como SYSTEM).
+    $candidate = Find-ProvisionedWinGet
+    if ($candidate) {
+        $script:WinGetExecutable = $candidate
+        return $script:WinGetExecutable
+    }
     return $null
+}
+
+function Find-ProvisionedWinGet {
+    param([string]$Root = (Join-Path $env:ProgramFiles 'WindowsApps'))
+    $architecture = if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64') { 'arm64' } elseif ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
+    try {
+        $folders = @(Get-ChildItem -LiteralPath $Root -Directory -Filter "Microsoft.DesktopAppInstaller_*_${architecture}__8wekyb3d8bbwe" -ErrorAction Stop)
+    } catch { return $null }
+    $best = $folders | ForEach-Object {
+        $version = $null
+        if ([version]::TryParse(($_.Name -split '_')[1], [ref]$version)) { [pscustomobject]@{ Version=$version; Path=(Join-Path $_.FullName 'winget.exe') } }
+    } | Where-Object { Test-Path -LiteralPath $_.Path } | Sort-Object Version -Descending | Select-Object -First 1
+    if ($best) { return $best.Path }
+    return $null
+}
+
+function Test-IsSystemAccount {
+    try { return [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem } catch { return $false }
 }
 
 function Invoke-WinGet {
@@ -846,6 +877,9 @@ function Install-VCRedist {
         Invoke-Download "https://aka.ms/vs/17/release/vc_redist.$architecture.exe" $installer
         if (-not (Test-DownloadSignature -Path $installer -Publisher 'Microsoft')) { throw 'vc_redist sin firma valida de Microsoft.' }
         $process = Start-Process -FilePath $installer -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru
+        Write-Diag "vc_redist termino con codigo $($process.ExitCode)"
+        # 1638: ya hay una version igual o mas nueva.
+        if ($process.ExitCode -eq 1638) { Write-Ok 'Visual C++ Redistributable ya instalado (version igual o mas nueva).'; return $true }
         if ($process.ExitCode -notin @(0, 3010)) { throw "El instalador VC++ devolvio el codigo $($process.ExitCode)." }
         Write-Ok 'Visual C++ Redistributable instalado.'
         return $true
@@ -872,6 +906,10 @@ function Test-AppSideloadingPolicy {
 }
 
 function Install-WinGetWithClientModule {
+    if (Test-IsSystemAccount) {
+        Write-WarnMsg 'Microsoft.WinGet.Client no puede reparar WinGet como SYSTEM; se omite ese respaldo.'
+        return $false
+    }
     try {
         Write-Info 'Intentando reparar WinGet con Microsoft.WinGet.Client...'
         Set-Tls12Enable
@@ -934,17 +972,25 @@ function Install-WinGet {
         $dependencies = @(Get-ChildItem -LiteralPath $architectureFolder -File -Recurse -ErrorAction Stop |
             Where-Object { $_.Extension -in @('.appx', '.msix') } | Sort-Object Name)
         if ($dependencies.Count -eq 0) { throw "No se encontraron dependencias para $architecture." }
+        # SYSTEM no puede registrar paquetes por usuario (0x80073CF9): solo se aprovisionan para el equipo.
+        $isSystem = Test-IsSystemAccount
+        if ($isSystem) { Write-Detail 'Ejecucion como SYSTEM: WinGet y sus dependencias se aprovisionan para todo el equipo.' }
         foreach ($dependencyFile in $dependencies) {
             $dependency = $dependencyFile.FullName
             Write-Info "Instalando dependencia: $($dependencyFile.Name)..."
             $escapedPath = $dependency.Replace("'", "''")
-            try { Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedPath' -ErrorAction Stop" } catch { Write-WarnMsg "No se pudo instalar $($dependencyFile.Name): $($_.Exception.Message)" }
+            if (-not $isSystem) {
+                try { Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedPath' -ErrorAction Stop" } catch { Write-WarnMsg "No se pudo instalar $($dependencyFile.Name): $($_.Exception.Message)" }
+            }
             try { Invoke-WindowsPowerShellCommand "Add-AppxProvisionedPackage -Online -PackagePath '$escapedPath' -SkipLicense -ErrorAction Stop | Out-Null" } catch { Write-WarnMsg "No se pudo aprovisionar: $(Split-Path $dependency -Leaf)" }
         }
         $escapedBundle = $bundlePath.Replace("'", "''")
         $escapedLicense = $licensePath.Replace("'", "''")
-        Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedBundle' -ErrorAction Stop"
+        if (-not $isSystem) {
+            try { Invoke-WindowsPowerShellCommand "Add-AppxPackage -Path '$escapedBundle' -ErrorAction Stop" } catch { Write-WarnMsg "No se pudo registrar WinGet para este usuario; se aprovisiona para el equipo: $($_.Exception.Message)" }
+        }
         Invoke-WindowsPowerShellCommand "Add-AppxProvisionedPackage -Online -PackagePath '$escapedBundle' -LicensePath '$escapedLicense' -ErrorAction Stop | Out-Null"
+        $script:WinGetExecutable = $null
         Start-Sleep -Seconds 3
         if (Test-WinGetInstalled) { Write-Ok 'WinGet instalado y verificado.'; return $true }
         throw 'WinGet no pudo verificarse despues de la instalacion.'
@@ -1098,6 +1144,7 @@ function Update-WinGetApps {
         }
         if (-not (Install-WinGet)) {
             Write-ErrMsg "❌ WinGet no está instalado o disponible en este sistema. Omitiendo."
+            $script:Failures.Add('WinGet: no se pudo instalar; ver el detalle en el log')
             return
         }
     }

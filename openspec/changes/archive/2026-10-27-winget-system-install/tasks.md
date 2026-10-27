@@ -1,0 +1,5 @@
+- [x] Documentar propuesta y diseno.
+- [x] Implementar.
+- [x] Pruebas (pwsh y 5.1): tests/WinGetSystemInstall.Tests.ps1.
+- [x] Confirmacion y subida.
+- [ ] Volver a ejecutar en lpzvmad01/02 y revisar logs.
