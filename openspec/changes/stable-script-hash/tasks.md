@@ -1,0 +1,5 @@
+- [x] Documentar propuesta y diseno.
+- [x] Quitar el punto final de la causa de RZGet en el resumen.
+- [x] Agregar .gitattributes y convertir los .ps1 versionados a CRLF.
+- [x] Pruebas y sintaxis 5.1; confirmacion y subida.
+- [ ] Verificar el mismo SHA-256 en copia local, commit y descarga raw de GitHub.

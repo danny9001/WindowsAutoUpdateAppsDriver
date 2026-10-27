@@ -647,7 +647,7 @@ function Update-RuckZuckApps {
                         Write-Detail "Logs completos: $($result.OutPath), $($result.ErrPath)"
                         # La causa que informa RZGet (ERR/FTL o "Installation failed") es mas util en el resumen que el codigo 0.
                         $reason = @($result.Stdout + $result.Stderr) | Where-Object { $_ -match '\[[^\]]*\s(ERR|FTL)\]|Installation failed' } | Select-Object -Last 1
-                        $reason = if ($reason) { ($reason -replace '^\s*\[[^\]]*\]\s*', '').Trim() } else { "codigo $code o instalacion no confirmada" }
+                        $reason = if ($reason) { ($reason -replace '^\s*\[[^\]]*\]\s*', '').Trim().TrimEnd('.') } else { "codigo $code o instalacion no confirmada" }
                         $script:Failures.Add("RuckZuck ${short}: $reason; log $($result.OutPath)")
                     }
                 } catch {

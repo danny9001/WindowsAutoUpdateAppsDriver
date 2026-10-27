@@ -1,0 +1,6 @@
+# Los scripts de PowerShell se guardan con CRLF y sin conversion de git: clone, ZIP y descarga raw
+# son identicos byte a byte, el SHA-256 del modo detallado identifica la version y una firma
+# Authenticode no se invalida por cambios de fin de linea.
+*.ps1 -text
+*.psm1 -text
+*.psd1 -text
