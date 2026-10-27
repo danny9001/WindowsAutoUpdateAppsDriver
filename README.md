@@ -70,12 +70,14 @@ On the first interactive run the script offers to create a weekly task (`UpdateA
 ## Tests
 
 ```powershell
-pwsh -NoProfile -File tests/ScheduledTask.Tests.ps1
-pwsh -NoProfile -File tests/WinGetContinuation.Tests.ps1
-pwsh -NoProfile -File tests/WinGetRecovery.Tests.ps1
+Get-ChildItem tests\*.Tests.ps1 | ForEach-Object { pwsh -NoProfile -File $_.FullName }
 ```
 
 They extract functions from the script and mock cmdlets; they do not update anything or register real tasks.
+
+## Archive
+
+Earlier versions (7.1, 7.2, 8, Silence) and scripts replaced by 8.1 (`CreateTask.ps1`, `Reinstalar-WinGet.ps1`, `Advanced-DriverDownloader*.ps1`) are kept in `archive/` for reference; they are no longer maintained. Completed OpenSpec changes are in `openspec/changes/archive/`.
 
 ## Credits
 
@@ -151,12 +153,14 @@ En la primera ejecución interactiva el script ofrece crear una tarea semanal (`
 ## Pruebas
 
 ```powershell
-pwsh -NoProfile -File tests/ScheduledTask.Tests.ps1
-pwsh -NoProfile -File tests/WinGetContinuation.Tests.ps1
-pwsh -NoProfile -File tests/WinGetRecovery.Tests.ps1
+Get-ChildItem tests\*.Tests.ps1 | ForEach-Object { pwsh -NoProfile -File $_.FullName }
 ```
 
 Extraen funciones del script y simulan cmdlets; no actualizan nada ni registran tareas reales.
+
+## Archivo
+
+Las versiones anteriores (7.1, 7.2, 8, Silence) y los scripts reemplazados por 8.1 (`CreateTask.ps1`, `Reinstalar-WinGet.ps1`, `Advanced-DriverDownloader*.ps1`) se conservan en `archive/` como referencia; ya no se mantienen. Los changes OpenSpec terminados están en `openspec/changes/archive/`.
 
 ## Créditos
 

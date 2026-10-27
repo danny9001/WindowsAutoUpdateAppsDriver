@@ -1,0 +1,6 @@
+- [x] Revisar uso de cada archivo, referencias y tareas programadas; documentar propuesta y diseno.
+- [x] Mover scripts anteriores a archive/ con git mv.
+- [x] Mover changes OpenSpec completos a openspec/changes/archive/.
+- [x] Ordenar archivos locales (archive/local y Logs) y excluir archive/local en .gitignore.
+- [x] Actualizar README y ejecutar todas las pruebas.
+- [x] Preparar confirmacion y subida del cambio.

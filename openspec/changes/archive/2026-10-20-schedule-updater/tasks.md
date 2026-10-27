@@ -3,4 +3,4 @@
 - [x] Evitar preguntas en ejecucion programada y preservar opciones al relanzar.
 - [x] Validar sintaxis y probar con cmdlets simulados (tests/ScheduledTask.Tests.ps1).
 - [x] Preparar publicacion del cambio y sincronizacion de copia local.
-- [ ] Vincular y archivar en MemAI cuando este disponible (limitacion de herramientas de la sesion).
+- [x] ~~Vincular y archivar en MemAI~~: no aplica; MemAI solo vincula changes del OpenSpec del servidor (ver archive-legacy-files).
