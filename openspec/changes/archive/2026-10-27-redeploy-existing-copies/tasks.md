@@ -1,0 +1,5 @@
+- [x] Documentar propuesta y diseno.
+- [x] Descubrir copias por tareas y actualizarlas.
+- [x] Pruebas (pwsh y Windows PowerShell 5.1) y documentacion.
+- [x] Confirmacion y subida.
+- [ ] Verificar en los servidores reales (LPZVMAD01: C:\Medios).

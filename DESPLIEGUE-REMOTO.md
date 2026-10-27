@@ -30,6 +30,7 @@ El instalador muestra estado por destino; los errores de un equipo no detienen l
 ## Resultado en cada destino
 
 - Copia el actualizador a `C:\ProgramData\GenIT\UpdateAppsDrivers` y verifica el SHA-256. Si ya existia una copia, deja un respaldo con sufijo `.backup-...`.
+- Busca las tareas programadas del equipo que ejecutan `UpdateAppsDrivers8.1.ps1` en otra carpeta (por ejemplo la semanal en `C:\Medios`) y actualiza esa copia en su sitio, con respaldo `.backup-...` y SHA-256. No cambia su JSON ni su tarea. Una copia ya al dia no se toca; si su tarea se esta ejecutando o el archivo no existe, se informa y el equipo queda `Parcial`. Solo se consideran rutas locales; las copias sin tarea no se encuentran.
 - Conserva `UpdateAppsDrivers8.1.config.json` si ya existe. Si no existe, crea uno sin preguntas ni tarea recurrente y con BIOS/firmware desactivado.
 - Registra `GenIT-UpdateAppsDrivers-Once-AAAAMMDD-HHMM` como SYSTEM, para una sola ejecucion en el horario local del destino. Si ya existe esa tarea de un despliegue anterior y no se esta ejecutando, actualiza el script (con respaldo y SHA-256) y conserva la tarea: el resultado dice `Actualizado`. Una tarea ajena con ese nombre o en ejecucion no se toca y se informa como error.
 - No inicia actualizaciones al desplegar. La tarea no elimina tareas antiguas del actualizador. Sus resultados se consultan en el Programador de tareas y en `C:\ProgramData\GenIT\UpdateAppsDrivers\Logs`.

@@ -122,14 +122,69 @@ function Invoke-UpdaterDeployment {
             [pscustomobject]@{TaskName=$name; ScriptPath=$destination; ConfigPath=$configuration; Backup=$backup; Hash=$expected; Reused=$false}
         }
         $stageFile=$null
-        if ($result.Reused) {
-            return [pscustomobject]@{ Equipo=$Target; Estado='Actualizado'; FechaLocal=$dateText; ZonaHoraria=$prepare.TimeZone; HoraEquipo=$prepare.LocalTime; Tarea=$result.TaskName; Script=$result.ScriptPath; Respaldo=$result.Backup; Detalle='Script actualizado; se conserva la tarea ya programada para esa fecha.' }
+        # Copias en otras carpetas que ejecutan las tareas del equipo (p. ej. la semanal en C:\Medios): se actualizan en su sitio.
+        try {
+            $copies=@(Invoke-Command -Session $session -ErrorAction Stop -ArgumentList $result.ScriptPath,$ExpectedHash -ScriptBlock {
+                param($main,$expected)
+                $ErrorActionPreference='Stop'
+                $found=[ordered]@{}
+                foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+                    foreach ($action in @($task.Actions)) {
+                        foreach ($match in [regex]::Matches("$($action.Execute) $($action.Arguments)", '(?i)-File\s+(?:"([^"]+)"|(\S+))')) {
+                            $path=if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+                            if ((Split-Path -Path $path -Leaf) -ine 'UpdateAppsDrivers8.1.ps1') { continue }
+                            if (-not [IO.Path]::IsPathRooted($path) -and $action.WorkingDirectory) { $path=Join-Path $action.WorkingDirectory $path }
+                            if ($path -notmatch '^[A-Za-z]:\\') { continue }
+                            try { $path=[IO.Path]::GetFullPath($path) } catch { continue }
+                            if ($path -ieq $main) { continue }
+                            $key=$path.ToLowerInvariant()
+                            if (-not $found.Contains($key)) { $found[$key]=[pscustomobject]@{Path=$path; Tasks=[Collections.Generic.List[object]]::new()} }
+                            $found[$key].Tasks.Add($task)
+                        }
+                    }
+                }
+                foreach ($entry in $found.Values) {
+                    $path=$entry.Path
+                    $stage=$null
+                    try {
+                        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'el archivo no existe' }
+                        $running=@($entry.Tasks | Where-Object { "$($_.State)" -eq 'Running' } | ForEach-Object { $_.TaskName })
+                        if ($running.Count) { throw "la tarea $($running -join ', ') se esta ejecutando" }
+                        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash -eq $expected) {
+                            [pscustomobject]@{Path=$path; Estado='al dia'; Respaldo=$null}
+                            continue
+                        }
+                        $stage=$path+'.'+[guid]::NewGuid().ToString('N')+'.staging'
+                        Copy-Item -LiteralPath $main -Destination $stage -ErrorAction Stop
+                        if ((Get-FileHash -LiteralPath $stage -Algorithm SHA256 -ErrorAction Stop).Hash -ne $expected) { throw 'el SHA-256 de la copia no coincide' }
+                        $copyBackup=$path+'.backup-'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[guid]::NewGuid().ToString('N')
+                        Copy-Item -LiteralPath $path -Destination $copyBackup -ErrorAction Stop
+                        Move-Item -LiteralPath $stage -Destination $path -Force -ErrorAction Stop
+                        $stage=$null
+                        [pscustomobject]@{Path=$path; Estado='actualizada'; Respaldo=$copyBackup}
+                    } catch {
+                        [pscustomobject]@{Path=$path; Estado="error: $($_.Exception.Message)"; Respaldo=$null}
+                    } finally {
+                        if ($stage) { Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue }
+                    }
+                }
+            })
+        } catch {
+            $copies=@([pscustomobject]@{Path='(busqueda de copias)'; Estado="error: $($_.Exception.Message)"; Respaldo=$null})
         }
-        return [pscustomobject]@{ Equipo=$Target; Estado='Programado'; FechaLocal=$dateText; ZonaHoraria=$prepare.TimeZone; HoraEquipo=$prepare.LocalTime; Tarea=$result.TaskName; Script=$result.ScriptPath; Respaldo=$result.Backup; Detalle='Verificar resultado en el Programador y en la carpeta Logs del destino.' }
+        $copyText=($copies | ForEach-Object { '{0} ({1})' -f $_.Path, $_.Estado }) -join '; '
+        $copyFailed=@($copies | Where-Object { $_.Estado -like 'error*' }).Count -gt 0
+        if ($result.Reused) {
+            $state='Actualizado'; $detail='Script actualizado; se conserva la tarea ya programada para esa fecha.'
+        } else {
+            $state='Programado'; $detail='Verificar resultado en el Programador y en la carpeta Logs del destino.'
+        }
+        if ($copyFailed) { $state='Parcial'; $detail+=' Alguna copia existente no se actualizo; ver Copias.' }
+        return [pscustomobject]@{ Equipo=$Target; Estado=$state; FechaLocal=$dateText; ZonaHoraria=$prepare.TimeZone; HoraEquipo=$prepare.LocalTime; Tarea=$result.TaskName; Script=$result.ScriptPath; Respaldo=$result.Backup; Copias=$copyText; CopiasDetalle=$copies; Detalle=$detail }
     } catch {
         $detail=$_.Exception.Message
         if ($stageFile) { $detail += " La copia pudo quedar en $DestinationFolder; revise el archivo .staging o el respaldo antes de reintentar." }
-        return [pscustomobject]@{ Equipo=$Target; Estado='Error'; FechaLocal=$Date.ToString('yyyy-MM-dd HH:mm'); ZonaHoraria=$null; HoraEquipo=$null; Tarea=$null; Script=$null; Respaldo=$null; Detalle=$detail }
+        return [pscustomobject]@{ Equipo=$Target; Estado='Error'; FechaLocal=$Date.ToString('yyyy-MM-dd HH:mm'); ZonaHoraria=$null; HoraEquipo=$null; Tarea=$null; Script=$null; Respaldo=$null; Copias=$null; CopiasDetalle=@(); Detalle=$detail }
     } finally {
         if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
     }
@@ -153,12 +208,18 @@ if ($MyInvocation.InvocationName -ne '.') {
         if (-not $WhatIfPreference -and -not $Credential) { $Credential=Get-Credential -Message 'Credenciales de dominio con administracion en los destinos' }
         if (-not $WhatIfPreference -and -not $Credential) { throw 'No se proporcionaron credenciales.' }
         $results=foreach($target in $targets) {
-            if ($PSCmdlet.ShouldProcess($target,"Copiar actualizador y programar ejecucion puntual para $UpdateAt")) {
+            if ($PSCmdlet.ShouldProcess($target,"Copiar actualizador, actualizar sus copias existentes y programar ejecucion puntual para $UpdateAt")) {
                 Write-Host "Procesando $target..." -ForegroundColor Cyan
                 Invoke-UpdaterDeployment -Target $target -Date $date -DomainCredential $Credential -LocalScript $source -DestinationFolder $RemoteFolder -ExpectedHash $sourceHash
             }
         }
         $results | Format-Table Equipo,Estado,FechaLocal,ZonaHoraria,Tarea,Detalle -Wrap -AutoSize
-        if (@($results | Where-Object Estado -eq 'Error').Count) { exit 1 }
+        foreach ($item in @($results | Where-Object { @($_.CopiasDetalle).Count })) {
+            Write-Host "Copias existentes en $($item.Equipo):" -ForegroundColor Cyan
+            foreach ($copy in $item.CopiasDetalle) {
+                Write-Host ("  {0}: {1}" -f $copy.Path, $copy.Estado) -ForegroundColor $(if ($copy.Estado -like 'error*') { 'Yellow' } else { 'Gray' })
+            }
+        }
+        if (@($results | Where-Object { $_.Estado -in @('Error','Parcial') }).Count) { exit 1 }
     } catch { Write-Error $_.Exception.Message; exit 1 }
 }
