@@ -20,6 +20,9 @@
 .PARAMETER SkipScheduleTask
   No preguntar por la tarea programada.
 
+.PARAMETER SkipLegacyTaskMigration
+  No modificar ni eliminar tareas de versiones anteriores.
+
 .PARAMETER ReconfigureTask
   Permite cambiar el horario aunque la tarea ya exista (por defecto, si existe no se pregunta).
 
@@ -60,6 +63,7 @@ param(
     [switch]$ForceWinGetReinstall,
     [switch]$ScheduledRun,
     [switch]$SkipScheduleTask,
+    [switch]$SkipLegacyTaskMigration,
     [switch]$ReconfigureTask,
     [switch]$IncludePinned,
     [switch]$IncludeUnknown,
@@ -347,6 +351,7 @@ function Ensure-PowerShell7 {
         if ($ForceWinGetReinstall) { $argsToPass += '-ForceWinGetReinstall' }
         if ($ScheduledRun) { $argsToPass += '-ScheduledRun' }
         if ($SkipScheduleTask) { $argsToPass += '-SkipScheduleTask' }
+        if ($SkipLegacyTaskMigration) { $argsToPass += '-SkipLegacyTaskMigration' }
         if ($ReconfigureTask) { $argsToPass += '-ReconfigureTask' }
         if ($IncludePinned) { $argsToPass += '-IncludePinned' }
         if ($IncludeUnknown) { $argsToPass += '-IncludeUnknown' }
@@ -1911,7 +1916,7 @@ if (Get-PendingReboot) { Write-WarnMsg "⚠️ Ya hay un reinicio pendiente ante
 
 # Flujo de actualización
 Configure-UpdaterScheduledTask
-Invoke-LegacyTaskMigration
+if (-not $SkipLegacyTaskMigration) { Invoke-LegacyTaskMigration }
 Update-RuckZuckApps
 Update-WinGetApps
 Update-MicrosoftStore
