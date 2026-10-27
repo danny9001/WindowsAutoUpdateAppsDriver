@@ -1,0 +1,5 @@
+- [x] Documentar propuesta y diseno.
+- [x] Extraer Install-RZGetFiles con respaldo y reversion del par.
+- [x] Recuperar reemplazos interrumpidos y limpiar huerfanos al iniciar Download-RZGet.
+- [x] Agregar pruebas de exito, reversion, recuperacion y limpieza; ejecutar todas las pruebas.
+- [x] Preparar confirmacion y subida del cambio.

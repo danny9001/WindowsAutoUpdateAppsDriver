@@ -419,6 +419,55 @@ function Get-IsServer {
 # -------------------------
 $Global:RZGetLatestUrl = 'https://github.com/rzander/ruckzuck/releases/latest/download/RZGet.exe'  # latest estable
 
+function Repair-RZGetFiles {
+    # Recupera un reemplazo interrumpido (corte, proceso detenido) y elimina temporales huerfanos de ejecuciones previas.
+    param([string[]]$Targets)
+    foreach ($target in $Targets) {
+        $folder = Split-Path -Parent $target
+        $leaf = [regex]::Escape((Split-Path -Leaf $target))
+        $leftovers = @(Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "^$leaf\.[0-9a-f]{32}\.(bak|download)$" })
+        $backup = $leftovers | Where-Object { $_.Extension -eq '.bak' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($backup -and -not (Test-Path -LiteralPath $target)) {
+            Move-Item -LiteralPath $backup.FullName -Destination $target -ErrorAction Stop
+            Write-WarnMsg "⚠️ Se restauro $(Split-Path -Leaf $target) desde un reemplazo interrumpido."
+        }
+        $leftovers | Where-Object { Test-Path -LiteralPath $_.FullName } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Install-RZGetFiles {
+    # Reemplaza los archivos ya verificados como un par: si uno falla, se devuelven los anteriores a su lugar.
+    param([object[]]$Files)
+    $done = [Collections.Generic.List[object]]::new()
+    try {
+        foreach ($file in $Files) {
+            $backup = $null
+            if (Test-Path -LiteralPath $file.Target) {
+                $backup = "$($file.Target).$([guid]::NewGuid().ToString('N')).bak"
+                Move-Item -LiteralPath $file.Target -Destination $backup -ErrorAction Stop
+            }
+            $entry = [pscustomobject]@{ Target=$file.Target; Backup=$backup; Placed=$false }
+            $done.Add($entry)
+            Move-Item -LiteralPath $file.Tmp -Destination $file.Target -ErrorAction Stop
+            $entry.Placed = $true
+        }
+    } catch {
+        $rollbackFailed = $false
+        for ($i = $done.Count - 1; $i -ge 0; $i--) {
+            $entry = $done[$i]
+            try {
+                if ($entry.Placed) { Remove-Item -LiteralPath $entry.Target -Force -ErrorAction Stop }
+                if ($entry.Backup) { Move-Item -LiteralPath $entry.Backup -Destination $entry.Target -ErrorAction Stop }
+            } catch { $rollbackFailed = $true }
+        }
+        if ($rollbackFailed) { throw "Reemplazo de RZGet incompleto y sin reversion total; la proxima ejecucion intentara recuperarlo: $($_.Exception.Message)" }
+        throw
+    }
+    foreach ($entry in $done) {
+        if ($entry.Backup) { Remove-Item -LiteralPath $entry.Backup -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Download-RZGet {
     param([string]$DestinationFolder = $OutputFolder)
     $dest = Join-Path $DestinationFolder 'RZGet.exe'
@@ -428,6 +477,7 @@ function Download-RZGet {
         if (Test-Path -LiteralPath $dest) { return $dest }
         throw 'DryRun no descarga RZGet; copie el ejecutable antes de consultar.'
     }
+    try { Repair-RZGetFiles -Targets @($dest, $destConfig) } catch { Write-WarnMsg "⚠️ No se pudo recuperar un reemplazo previo de RZGet: $($_.Exception.Message)" }
     if ((Test-Path -LiteralPath $dest) -and (Test-Path -LiteralPath $destConfig) -and ((Get-Item -LiteralPath $dest).LastWriteTime -gt (Get-Date).AddDays(-$script:UpdaterConfig.RuckZuck.VersionCheckDays))) { return $dest }
     Set-Tls12Enable; Set-ProxyDefaults
     $staged = [Collections.Generic.List[object]]::new()
@@ -451,9 +501,9 @@ function Download-RZGet {
         if ($staged.Count -eq 0) { Write-Info "RZGet $($release.tag_name) ya esta actualizado." }
         foreach ($file in $staged) {
             if ($file.Target -eq $dest) { Test-DownloadSignature -Path $file.Tmp -WarnOnly | Out-Null }
-            Move-Item -LiteralPath $file.Tmp -Destination $file.Target -Force -ErrorAction Stop
-            Write-Ok "✅ $($file.Name) descargado en: $($file.Target)"
         }
+        Install-RZGetFiles -Files $staged.ToArray()
+        foreach ($file in $staged) { Write-Ok "✅ $($file.Name) descargado en: $($file.Target)" }
         (Get-Item -LiteralPath $dest).LastWriteTime = Get-Date
     } catch {
         foreach ($file in $staged) { Remove-Item -LiteralPath $file.Tmp -Force -ErrorAction SilentlyContinue }

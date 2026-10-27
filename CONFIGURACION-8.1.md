@@ -24,7 +24,7 @@ El script lee `UpdateAppsDrivers8.1.config.json` en su misma carpeta antes de ej
 - `RuckZuck.DelayDays`: edad minima de actualizaciones detectadas, de 0 a 365 dias; 0 mantiene el comportamiento anterior. No se aplica a la comprobacion posterior.
 - `RuckZuck.ScanTimeoutSeconds`: limite por consulta, 10 a 3600 segundos (180 por defecto).
 - `RuckZuck.InstallTimeoutSeconds`: limite por instalacion, 30 a 14400 segundos (1800 por defecto). Al agotarlo se detiene RZGet y se interrumpen sus siguientes paquetes; Windows Installer podria seguir activo.
-- `RuckZuck.VersionCheckDays`: frecuencia de consulta de la ultima version, de 1 a 90 dias (7 por defecto). Se compara SHA-256 con el digest de la release de GitHub antes de reemplazar RZGet. Si falla la consulta se conserva la copia anterior con aviso.
+- `RuckZuck.VersionCheckDays`: frecuencia de consulta de la ultima version, de 1 a 90 dias (7 por defecto). Se compara SHA-256 con el digest de la release de GitHub antes de reemplazar RZGet. Si falla la consulta se conserva la copia anterior con aviso. `RZGet.exe` y `RZGet.exe.config` se reemplazan juntos: si falla uno se restauran ambos anteriores, y un reemplazo interrumpido se recupera en la siguiente ejecucion.
 - `Schedule.Enabled: true`: crea o actualiza la tarea de esta copia del script sin preguntas. Usa SYSTEM y requiere administrador. Valores de dia: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday. Hora local en formato HH:mm.
 - `Schedule.Enabled: false`: no crea/actualiza tareas. No elimina ni desactiva una tarea que ya exista; puede desactivarse desde el Programador de tareas.
 
