@@ -17,11 +17,13 @@ $script:UpdaterConfig.SkipStore=$true
 $script:UpdaterConfig.Schedule.Enabled=$true
 $script:UpdaterConfig.Schedule.DayOfWeek='Friday'
 $script:UpdaterConfig.Schedule.Time='03:15'
+$script:UpdaterConfig.RuckZuck.SkipShortNames=@('Firefox')
+$script:UpdaterConfig.RuckZuck.DelayDays=5
 Save-UpdaterConfiguration
 Initialize-UpdaterConfiguration
-if($script:UpdaterConfig.SkipPackages[0] -ne 'Microsoft.VCRedist.2015+.x64' -or -not $script:UpdaterConfig.SkipStore -or $script:UpdaterConfig.Schedule.Time -ne '03:15'){throw 'No se conservaron las decisiones'}
+if($script:UpdaterConfig.SkipPackages[0] -ne 'Microsoft.VCRedist.2015+.x64' -or -not $script:UpdaterConfig.SkipStore -or $script:UpdaterConfig.Schedule.Time -ne '03:15' -or $script:UpdaterConfig.RuckZuck.SkipShortNames[0] -ne 'Firefox' -or $script:UpdaterConfig.RuckZuck.DelayDays -ne 5){throw 'No se conservaron las decisiones'}
 $validConfig=Get-Content -LiteralPath $script:UpdaterConfigPath -Raw
-foreach($invalid in @('{invalid json}', '{"AskQuestions":"false"}', '{"SkipPackages":"Test.App"}', '{"Schedule":{"Time":"25:00"}}', '{"Schedule":{"DayOfWeek":"monday"}}')) {
+foreach($invalid in @('{invalid json}', '{"AskQuestions":"false"}', '{"SkipPackages":"Test.App"}', '{"Schedule":{"Time":"25:00"}}', '{"Schedule":{"DayOfWeek":"monday"}}', '{"RuckZuck":{"SkipShortNames":"Firefox"}}', '{"RuckZuck":{"InstallTimeoutSeconds":1}}', '{"RuckZuck":{"DelayDays":"5"}}')) {
     Set-Content -LiteralPath $script:UpdaterConfigPath -Value $invalid
     $rejected=$false
     try { Initialize-UpdaterConfiguration } catch {$rejected=$true}

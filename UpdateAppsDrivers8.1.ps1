@@ -117,6 +117,7 @@ function Initialize-UpdaterConfiguration {
         SkipPackages = @()
         InstallWinGetIfMissing = $true
         Schedule = [pscustomobject]@{ Enabled=$false; DayOfWeek='Sunday'; Time='22:00' }
+        RuckZuck = [pscustomobject]@{ SkipShortNames=@(); DelayDays=0; ScanTimeoutSeconds=180; InstallTimeoutSeconds=1800; VersionCheckDays=7 }
     }
     if (Test-Path -LiteralPath $script:UpdaterConfigPath) {
         try {
@@ -137,6 +138,25 @@ function Initialize-UpdaterConfiguration {
                 if ($data.Schedule -isnot [pscustomobject]) { throw 'Schedule debe ser un objeto JSON.' }
                 foreach ($name in @('Enabled','DayOfWeek','Time')) {
                     if ($data.Schedule.PSObject.Properties.Name -contains $name) { $script:UpdaterConfig.Schedule.$name = $data.Schedule.$name }
+                }
+            }
+            if ($data.PSObject.Properties.Name -contains 'RuckZuck') {
+                $rz = $data.RuckZuck
+                if ($rz -isnot [pscustomobject]) { throw 'RuckZuck debe ser un objeto JSON.' }
+                if ($rz.PSObject.Properties.Name -contains 'SkipShortNames') {
+                    if ($rz.SkipShortNames -isnot [array]) { throw 'RuckZuck.SkipShortNames debe ser un arreglo.' }
+                    foreach ($short in $rz.SkipShortNames) {
+                        if ($short -isnot [string] -or $short -notmatch '^[\w.+\-]+$') { throw "ShortName omitido invalido: $short" }
+                    }
+                    $script:UpdaterConfig.RuckZuck.SkipShortNames = @($rz.SkipShortNames | Select-Object -Unique)
+                }
+                foreach ($setting in @(@('DelayDays',0,365),@('ScanTimeoutSeconds',10,3600),@('InstallTimeoutSeconds',30,14400),@('VersionCheckDays',1,90))) {
+                    $name=$setting[0]
+                    if ($rz.PSObject.Properties.Name -contains $name) {
+                        $value=$rz.$name
+                        if (($value -isnot [int] -and $value -isnot [long]) -or $value -lt $setting[1] -or $value -gt $setting[2]) { throw "RuckZuck.$name debe ser un entero entre $($setting[1]) y $($setting[2])." }
+                        $script:UpdaterConfig.RuckZuck.$name = [int]$value
+                    }
                 }
             }
             $schedule = $script:UpdaterConfig.Schedule
@@ -402,24 +422,71 @@ $Global:RZGetLatestUrl = 'https://github.com/rzander/ruckzuck/releases/latest/do
 function Download-RZGet {
     param([string]$DestinationFolder = $OutputFolder)
     $dest = Join-Path $DestinationFolder 'RZGet.exe'
-    # Reutilizar si tiene menos de 7 dias; si no, intentar refrescar (y conservar el anterior si falla).
-    if ((Test-Path $dest) -and ((Get-Item $dest).LastWriteTime -gt (Get-Date).AddDays(-7))) { return $dest }
-    Write-Info "📥 Descargando RZGet.exe (RuckZuck)..."
+    if ($DryRun) {
+        if (Test-Path -LiteralPath $dest) { return $dest }
+        throw 'DryRun no descarga RZGet; copie el ejecutable antes de consultar.'
+    }
+    if ((Test-Path -LiteralPath $dest) -and ((Get-Item -LiteralPath $dest).LastWriteTime -gt (Get-Date).AddDays(-$script:UpdaterConfig.RuckZuck.VersionCheckDays))) { return $dest }
     Set-Tls12Enable; Set-ProxyDefaults
-    $tmp = "$dest.download"
+    $tmp = "$dest.$([guid]::NewGuid().ToString('N')).download"
     try {
-        $iwrParams = @{ Uri = $Global:RZGetLatestUrl; OutFile = $tmp; ErrorAction='Stop' }
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/rzander/ruckzuck/releases/latest' -Headers @{ 'User-Agent'='UpdateAppsDrivers8.1' } -ErrorAction Stop
+        $asset = $release.assets | Where-Object { $_.name -eq 'RZGet.exe' } | Select-Object -First 1
+        if (-not $asset -or $asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') { throw 'La version publicada no incluye un SHA-256 verificable para RZGet.exe.' }
+        $expectedHash = $Matches[1]
+        if ((Test-Path -LiteralPath $dest) -and (Get-FileHash -LiteralPath $dest -Algorithm SHA256 -ErrorAction Stop).Hash -eq $expectedHash) {
+            (Get-Item -LiteralPath $dest).LastWriteTime = Get-Date
+            Write-Info "RZGet $($release.tag_name) ya esta actualizado."
+            return $dest
+        }
+        Write-Info "📥 Descargando RZGet $($release.tag_name) y comprobando SHA-256..."
+        $iwrParams = @{ Uri = $asset.browser_download_url; OutFile = $tmp; ErrorAction='Stop' }
         if ($PSVersionTable.PSVersion.Major -lt 7) { $iwrParams.UseBasicParsing = $true }
         Invoke-WebRequest @iwrParams
+        if ((Get-FileHash -LiteralPath $tmp -Algorithm SHA256 -ErrorAction Stop).Hash -ne $expectedHash) { throw 'SHA-256 de RZGet no coincide con el publicado por GitHub.' }
         Test-DownloadSignature -Path $tmp -WarnOnly | Out-Null
-        Move-Item -LiteralPath $tmp -Destination $dest -Force
+        Move-Item -LiteralPath $tmp -Destination $dest -Force -ErrorAction Stop
         Write-Ok "✅ RZGet.exe descargado en: $dest"
     } catch {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path $dest)) { throw }
-        Write-WarnMsg "⚠️ No se pudo refrescar RZGet.exe; se usa la copia existente."
+        if (-not (Test-Path -LiteralPath $dest)) { throw }
+        Write-WarnMsg "⚠️ No se pudo verificar o refrescar RZGet; se usa la copia existente: $($_.Exception.Message)"
     }
     return $dest
+}
+
+function Invoke-RuckZuckProcess {
+    param([string]$Executable, [string[]]$Arguments, [int]$TimeoutSeconds, [string]$LogLabel)
+    $logDir = Join-Path $LogFolder 'RuckZuck'
+    New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+    $safeLabel = $LogLabel -replace '[^\w.\-]', '_'
+    $logBase = Join-Path $logDir (('{0:yyyyMMdd-HHmmss}-{1}-{2}' -f (Get-Date), $safeLabel, [guid]::NewGuid().ToString('N')))
+    $outPath = "$logBase.stdout.log"; $errPath = "$logBase.stderr.log"
+    $quotedArgs = @($Arguments | ForEach-Object { '"' + $_.Replace('"','\"') + '"' })
+    $process = Start-Process -FilePath $Executable -ArgumentList $quotedArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $outPath -RedirectStandardError $errPath -ErrorAction Stop
+    $finished = $process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $finished) {
+        try { Stop-Process -Id $process.Id -Force -ErrorAction Stop; $process.WaitForExit() } catch { Write-WarnMsg "No se pudo detener RZGet ($($process.Id)): $($_.Exception.Message)" }
+    }
+    $stdout = if (Test-Path -LiteralPath $outPath) { @(Get-Content -LiteralPath $outPath -ErrorAction SilentlyContinue) } else { @() }
+    $stderr = if (Test-Path -LiteralPath $errPath) { @(Get-Content -LiteralPath $errPath -ErrorAction SilentlyContinue) } else { @() }
+    return [pscustomobject]@{ TimedOut=(-not $finished); ExitCode=$(if ($finished) { $process.ExitCode } else { $null }); Stdout=$stdout; Stderr=$stderr; OutPath=$outPath; ErrPath=$errPath }
+}
+
+function Get-RuckZuckPending {
+    param([string]$Executable, [string[]]$ScopeArgs, [int]$DelayDays=0, [string]$LogLabel='consulta')
+    $argsList = @('update','--list','--all') + @($ScopeArgs)
+    if ($DelayDays -gt 0) { $argsList += "--delay=$DelayDays" }
+    $result = Invoke-RuckZuckProcess -Executable $Executable -Arguments $argsList -TimeoutSeconds $script:UpdaterConfig.RuckZuck.ScanTimeoutSeconds -LogLabel $LogLabel
+    if ($result.TimedOut) { throw "Consulta RZGet supero el tiempo limite. Log: $($result.ErrPath)" }
+    if ($result.ExitCode -ne 0) { throw "Consulta RZGet fallo con codigo $($result.ExitCode). Logs: $($result.OutPath), $($result.ErrPath)" }
+    if (@($result.Stderr | Where-Object { $_ -match '\S' }).Count -gt 0 -or @($result.Stdout | Where-Object { $_ -match '^\s*(\[.*\s(ERR|FTL)\]|E\d+:|E2)' }).Count -gt 0) {
+        throw "Consulta RZGet produjo errores. Logs: $($result.OutPath), $($result.ErrPath)"
+    }
+    $lines = @($result.Stdout | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $invalid = @($lines | Where-Object { $_ -notmatch '^[\w.+\-]+$' })
+    if ($invalid.Count -gt 0) { throw "La consulta RZGet devolvio lineas inesperadas. Log: $($result.OutPath)" }
+    return @($lines | Select-Object -Unique)
 }
 
 function Update-RuckZuckApps {
@@ -439,14 +506,20 @@ function Update-RuckZuckApps {
     $scopes = @(@{ Name = 'máquina'; Args = @() })
     if (-not $ScheduledRun) { $scopes += @{ Name = 'usuario'; Args = @('--user') } }
 
+    $haltRuckZuck = $false
     foreach ($scope in $scopes) {
         Write-Host ("  ▸ Ámbito: {0}" -f $scope.Name) -ForegroundColor Cyan
         try {
             $scopeArgs = @($scope.Args)
             # 'update --list' devuelve un nombre corto (Shortname) por linea; vacio si no hay nada.
-            $pending = @(& $rzPath update --list --all @scopeArgs 2>&1 | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^\S+$' } | Select-Object -Unique)
+            $pending = @(Get-RuckZuckPending -Executable $rzPath -ScopeArgs $scopeArgs -DelayDays $script:UpdaterConfig.RuckZuck.DelayDays -LogLabel "lista-$($scope.Name)")
+            foreach ($excludedShort in @($pending | Where-Object { $_ -in $script:UpdaterConfig.RuckZuck.SkipShortNames })) {
+                Write-Detail "Omitido por configuracion: $excludedShort"
+                $script:Skipped.Add("RuckZuck ${excludedShort}: excluido")
+            }
+            $pending = @($pending | Where-Object { $_ -notin $script:UpdaterConfig.RuckZuck.SkipShortNames })
             if ($pending.Count -eq 0) {
-                Write-Ok "    ✅ Sin actualizaciones pendientes."
+                Write-Info "    No se detectaron actualizaciones (RZGet devolvio una lista vacia)."
                 continue
             }
             Write-WarnMsg ("    📋 Actualizaciones disponibles: {0}" -f $pending.Count)
@@ -455,19 +528,27 @@ function Update-RuckZuckApps {
                 continue
             }
             $index = 0
+            $needsVerification = [Collections.Generic.List[object]]::new()
             foreach ($short in $pending) {
                 $index++
                 Write-Host ("    [{0}/{1}] {2} ... " -f $index, $pending.Count, $short) -NoNewline -ForegroundColor White
                 try {
-                    $rzOut = @(& $rzPath update $short --retry @scopeArgs 2>&1 | ForEach-Object { [string]$_ })
-                    $code = $LASTEXITCODE
-                    if ($code -eq 0) {
-                        Write-Ok 'OK'
-                        $script:Successes.Add("RuckZuck $short")
+                    $result = Invoke-RuckZuckProcess -Executable $rzPath -Arguments (@('update',$short,'--retry') + $scopeArgs) -TimeoutSeconds $script:UpdaterConfig.RuckZuck.InstallTimeoutSeconds -LogLabel "update-$short"
+                    $code = $result.ExitCode
+                    if ($result.TimedOut) {
+                        Write-Host 'TIEMPO AGOTADO' -ForegroundColor Red
+                        Write-WarnMsg 'Se detuvo RZGet. Windows Installer podria continuar en segundo plano; se omiten los siguientes paquetes de este ambito.'
+                        $script:Failures.Add("RuckZuck ${short}: tiempo agotado; log $($result.OutPath)")
+                        $haltRuckZuck = $true
+                        break
+                    } elseif ($code -eq 0 -and (($result.Stdout -join "`n") -match ('(?im)^(?:\[[^\r\n]*\]\s*)?Installation finished:\s*[\x22\x27]?' + [regex]::Escape($short) + '(?:[\x22\x27\s]|$)'))) {
+                        Write-Host 'PENDIENTE DE VERIFICACION' -ForegroundColor Yellow
+                        $needsVerification.Add([pscustomobject]@{ ShortName=$short; Log=$result.OutPath })
                     } else {
-                        Write-Host "FALLO (código $code)" -ForegroundColor Red
-                        $rzOut | Where-Object { $_ -match '\S' } | Select-Object -Last 3 | ForEach-Object { Write-Detail $_.Trim() }
-                        $script:Failures.Add("RuckZuck ${short}: codigo $code")
+                        Write-Host "FALLO O NO CONFIRMADO (código $code)" -ForegroundColor Red
+                        @($result.Stdout + $result.Stderr) | Where-Object { $_ -match '\S' } | Select-Object -Last 3 | ForEach-Object { Write-Detail $_.Trim() }
+                        Write-Detail "Logs completos: $($result.OutPath), $($result.ErrPath)"
+                        $script:Failures.Add("RuckZuck ${short}: codigo $code o instalacion no confirmada; log $($result.OutPath)")
                     }
                 } catch {
                     Write-Host 'ERROR' -ForegroundColor Red
@@ -475,6 +556,24 @@ function Update-RuckZuckApps {
                     $script:Failures.Add("RuckZuck ${short}: $($_.Exception.Message)")
                 }
             }
+            if ($needsVerification.Count -gt 0) {
+                try {
+                    $remaining = @(Get-RuckZuckPending -Executable $rzPath -ScopeArgs $scopeArgs -LogLabel "verificacion-$($scope.Name)")
+                    foreach ($attempt in $needsVerification) {
+                        if ($attempt.ShortName -in $remaining) {
+                            Write-WarnMsg "⚠️ $($attempt.ShortName) sigue pendiente; revise $($attempt.Log)."
+                            $script:Failures.Add("RuckZuck $($attempt.ShortName): sigue pendiente; log $($attempt.Log)")
+                        } else {
+                            Write-Ok "✅ $($attempt.ShortName): RZGet reporto finalizacion y ya no figura pendiente."
+                            $script:Successes.Add("RuckZuck $($attempt.ShortName)")
+                        }
+                    }
+                } catch {
+                    Write-WarnMsg "No se pudo verificar el resultado RuckZuck: $($_.Exception.Message)"
+                    foreach ($attempt in $needsVerification) { $script:Failures.Add("RuckZuck $($attempt.ShortName): resultado sin verificar; log $($attempt.Log)") }
+                }
+            }
+            if ($haltRuckZuck) { Write-WarnMsg 'Se omiten los demas ambitos de RuckZuck hasta revisar el instalador pendiente.'; break }
         } catch {
             $script:Failures.Add("RZGet ($($scope.Name)): $($_.Exception.Message)")
             Write-ErrMsg "    ❌ Error RZGet ($($scope.Name)): $($_.Exception.Message)"

@@ -3,6 +3,13 @@
   "SkipStore": false,
   "SkipPackages": [],
   "InstallWinGetIfMissing": true,
+  "RuckZuck": {
+    "SkipShortNames": [],
+    "DelayDays": 0,
+    "ScanTimeoutSeconds": 180,
+    "InstallTimeoutSeconds": 1800,
+    "VersionCheckDays": 7
+  },
   "Schedule": {
     "Enabled": false,
     "DayOfWeek": "Sunday",

@@ -1,0 +1,6 @@
+- [x] Revisar RZGet y documentar propuesta y diseno.
+- [x] Agregar configuracion compatible y validada.
+- [x] Implementar consultas seguras, exclusiones, timeout y verificacion posterior.
+- [x] Controlar version e integridad de la descarga con digest de GitHub.
+- [x] Probar con procesos inofensivos, simulacion y regresiones; documentar.
+- [x] Preparar sincronizacion local preservando configuracion y publicacion en GitHub.
