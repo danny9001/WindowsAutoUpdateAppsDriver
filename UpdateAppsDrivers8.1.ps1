@@ -360,6 +360,24 @@ function Ensure-PowerShell7 {
     exit $LASTEXITCODE
 }
 
+# Mutex global del actualizador; devuelve $null si otra ejecucion lo tiene. Uno abandonado (proceso terminado) cuenta como tomado.
+function Enter-UpdaterSingleInstance {
+    param([string]$Name = 'Global\GenIT-UpdateAppsDrivers8.1')
+    $mutex = $null
+    try {
+        $mutex = [Threading.Mutex]::new($false, $Name)
+        if ($mutex.WaitOne(0)) { return $mutex }
+    } catch [Threading.AbandonedMutexException] {
+        return $mutex
+    } catch {
+        # Sin permiso para crear el mutex global: no se bloquea la ejecucion.
+        Write-Diag "No se pudo usar el mutex ${Name}: $($_.Exception.Message)"
+        return $true
+    }
+    $mutex.Dispose()
+    return $null
+}
+
 # Ubica pwsh.exe aunque el PATH del proceso sea anterior a la instalacion de PowerShell 7.
 function Find-PwshPath {
     try {
@@ -1942,6 +1960,15 @@ if (-not (Test-IsAdmin)) {
 
 if ($DryRun) { Write-WarnMsg "ℹ️ Modo DryRun: solo se listan las actualizaciones pendientes." }
 if (Get-PendingReboot) { Write-WarnMsg "⚠️ Ya hay un reinicio pendiente antes de empezar; algunas instalaciones podrían fallar." }
+
+# Una sola ejecucion por equipo (p. ej. una tarea inmediata y la programada). Se toma despues del
+# relanzamiento: si lo tuviera el proceso 5.1, el pwsh relanzado no podria tomarlo.
+$script:UpdaterMutex = Enter-UpdaterSingleInstance
+if (-not $script:UpdaterMutex) {
+    Write-WarnMsg "⚠️ Ya hay otra ejecucion del actualizador en este equipo; se omite esta."
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 2
+}
 
 # Flujo de actualización
 Configure-UpdaterScheduledTask

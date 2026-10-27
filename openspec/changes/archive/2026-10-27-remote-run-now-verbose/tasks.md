@@ -1,0 +1,6 @@
+- [x] Documentar propuesta y diseno.
+- [x] Mutex en el actualizador.
+- [x] RunNow, UpdaterVerbose y CollectLogs en el despliegue (corregido [bool] en -ArgumentList, que se pasaba como texto verdadero).
+- [x] Pruebas (pwsh y 5.1) y documentacion.
+- [x] Confirmacion y subida.
+- [ ] Ejecucion real con -RunNow -UpdaterVerbose y revision de logs.

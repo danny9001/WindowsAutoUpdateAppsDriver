@@ -38,3 +38,21 @@ El instalador muestra estado por destino; los errores de un equipo no detienen l
 - En tareas SYSTEM, las aplicaciones instaladas solo para perfiles de usuario y Microsoft Store pueden quedar fuera. El instalador no configura WinRM, DNS, firewall, puertos o TrustedHosts.
 
 Si un fallo ocurre despues de copiar, puede quedar un archivo `.staging` o una copia nueva sin tarea: revise la carpeta y el respaldo antes de reintentar. No se usan credenciales de dominio en la tarea. La instalacion es simulada en las pruebas; pruebe primero en un equipo no critico y compruebe el resultado antes de extenderla.
+
+## Ejecucion inmediata y logs
+
+Para iniciar la actualizacion ya, en todos los destinos a la vez y en modo detallado:
+
+```powershell
+.\Deploy-UpdateAppsDriversRemote.ps1 -ComputerListPath C:\Script\equipos.txt -RunNow -UpdaterVerbose
+```
+
+Registra en cada destino `GenIT-UpdateAppsDrivers-Now-AAAAMMDD-HHMMSS` (SYSTEM, sin disparador), actualiza el script y sus copias como en un despliegue programado e inicia la tarea. `-UpdaterVerbose` tambien sirve con `-UpdateAt`. El actualizador no admite dos ejecuciones a la vez en el mismo equipo: si coincide con otra (por ejemplo, la programada), la segunda termina con codigo 2 sin hacer cambios.
+
+Para revisar el avance o el resultado, en cualquier momento:
+
+```powershell
+.\Deploy-UpdateAppsDriversRemote.ps1 -ComputerListPath C:\Script\equipos.txt -CollectLogs
+```
+
+Copia los `Actualizar-*.log` de las ultimas 24 horas (`-LogHours`) de cada destino a `C:\Script\Logs\Remote\<equipo>` y muestra el estado de las tareas GenIT (en ejecucion, ultima ejecucion y resultado). Se puede repetir mientras la actualizacion sigue en curso.

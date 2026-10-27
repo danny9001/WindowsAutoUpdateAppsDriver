@@ -18,14 +18,17 @@ $credential=[pscredential]::new('example\admin',(ConvertTo-SecureString 'not-a-r
 $script:FakeTasks=@{}; $script:Registrations=0
 function New-PSSession {param($ComputerName,$Credential,$Authentication,$ErrorAction) if($ComputerName -eq 'unreachable'){throw 'WinRM no disponible'}; return [pscustomobject]@{Name=$ComputerName} }
 function Remove-PSSession {param($Session,$ErrorAction)}
-function Invoke-Command {param($Session,$ErrorAction,$ArgumentList,$ScriptBlock) & $ScriptBlock @ArgumentList }
-function Copy-Item {param($LiteralPath,$Destination,$ToSession,[switch]$Force,$ErrorAction) Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force -ErrorAction Stop }
-function Get-ScheduledTask {param($TaskName,$ErrorAction) if(-not $TaskName){return @($script:FakeTasks.Values)}; if($script:FakeTasks.ContainsKey($TaskName)){return $script:FakeTasks[$TaskName]} }
+function Invoke-Command {param($Session,$ErrorAction,$ArgumentList,$ScriptBlock) $list=@($ArgumentList); & $ScriptBlock @list }
+function Copy-Item {param($LiteralPath,$Destination,$ToSession,$FromSession,[switch]$Force,$ErrorAction) Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force -ErrorAction Stop }
+function Get-ScheduledTask {param($TaskName,$ErrorAction) if(-not $TaskName){return @($script:FakeTasks.Values)}; if($TaskName -match '\*'){return @($script:FakeTasks.Keys | Where-Object { $_ -like $TaskName } | ForEach-Object { $script:FakeTasks[$_] })}; if($script:FakeTasks.ContainsKey($TaskName)){return $script:FakeTasks[$TaskName]} }
+function Get-ScheduledTaskInfo {param([Parameter(ValueFromPipeline=$true)]$InputObject) process { [pscustomobject]@{LastRunTime=(Get-Date).AddMinutes(-5); LastTaskResult=267009} } }
+function Start-ScheduledTask {param($TaskName,$ErrorAction) $script:FakeTasks[$TaskName].State='Running'; $script:Started+=@($TaskName) }
+$script:Started=@()
 function New-ScheduledTaskAction {param($Execute,$Argument,$WorkingDirectory,$ErrorAction) [pscustomobject]@{Execute=$Execute; Argument=$Argument; WorkingDirectory=$WorkingDirectory} }
 function New-ScheduledTaskTrigger {param([switch]$Once,$At,$ErrorAction) [pscustomobject]@{Once=$Once;At=$At} }
 function New-ScheduledTaskPrincipal {param($UserId,$LogonType,$RunLevel,$ErrorAction) [pscustomobject]@{UserId=$UserId;RunLevel=$RunLevel} }
 function New-ScheduledTaskSettingsSet {param($MultipleInstances,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$ExecutionTimeLimit,$ErrorAction) [pscustomobject]@{MultipleInstances=$MultipleInstances} }
-function Register-ScheduledTask {param($TaskName,$Action,$Trigger,$Principal,$Settings,$Description,$ErrorAction) $script:FakeTasks[$TaskName]=[pscustomobject]@{Action=$Action;Actions=@([pscustomobject]@{Arguments=$Action.Argument});Description=$Description;State='Ready';Trigger=$Trigger;Principal=$Principal;Settings=$Settings}; $script:Registrations++ }
+function Register-ScheduledTask {param($TaskName,$Action,$Trigger,$Principal,$Settings,$Description,$ErrorAction) $script:FakeTasks[$TaskName]=[pscustomobject]@{TaskName=$TaskName;Action=$Action;Actions=@([pscustomobject]@{Arguments=$Action.Argument});Description=$Description;State='Ready';Trigger=$Trigger;Principal=$Principal;Settings=$Settings}; $script:Registrations++ }
 $date=(Get-Date).AddDays(2)
 $date=[datetime]::ParseExact($date.ToString('yyyy-MM-dd HH:mm'),'yyyy-MM-dd HH:mm',[Globalization.CultureInfo]::InvariantCulture)
 $result=Invoke-UpdaterDeployment -Target 'PC01' -Date $date -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash
@@ -87,4 +90,26 @@ if($byPath['NoExiste'].Estado -notmatch 'no existe'){throw 'No se informo la cop
 if((Get-Content -LiteralPath (Join-Path $dirs['Plain'] 'UpdateAppsDrivers7.1.ps1') -Raw).Trim() -ne '# otra version'){throw 'Se toco otra version del actualizador'}
 if((Get-Content -LiteralPath (Join-Path $dirs['Medios con espacio'] 'UpdateAppsDrivers8.1.config.json') -Raw).Trim() -ne '{"RuckZuck":{"SkipShortNames":["Npcap"]}}'){throw 'Se modifico el JSON de una copia'}
 if(@($dirs.Values | ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter '*.staging' }).Count){throw 'Quedaron archivos .staging'}
-'PASS: fechas, validacion, copia, hash, tarea unica SYSTEM, actualizacion con tarea propia existente, proteccion de tareas ajenas o en ejecucion, copias existentes en otras carpetas y error WinRM; sin conexiones reales.'
+
+# Ejecucion inmediata en modo detallado: tarea sin disparador, iniciada al final.
+$script:FakeTasks=@{}
+$now=Invoke-UpdaterDeployment -Target 'PC04' -Date ([datetime]::MinValue) -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash -RunNow -UpdaterVerbose
+if($now.Estado -ne 'Iniciado' -or $now.Tarea -notmatch '^GenIT-UpdateAppsDrivers-Now-\d{8}-\d{6}$'){throw "Ejecucion inmediata incorrecta: $($now.Estado) $($now.Detalle)"}
+$nowTask=$script:FakeTasks[$now.Tarea]
+if($nowTask.Trigger){throw 'La tarea inmediata no debe tener disparador'}
+if($script:Started -notcontains $now.Tarea){throw 'No se inicio la tarea inmediata'}
+if($nowTask.Action.Argument -notmatch '-ScheduledRun.* -Verbose$'){throw "Falta -Verbose: $($nowTask.Action.Argument)"}
+$scheduled=Invoke-UpdaterDeployment -Target 'PC04' -Date $date.AddMinutes(9) -DomainCredential $credential -LocalScript $source -DestinationFolder $testRoot -ExpectedHash $hash
+if($script:FakeTasks[$scheduled.Tarea].Action.Argument -match '-Verbose' -or -not $script:FakeTasks[$scheduled.Tarea].Trigger){throw "La tarea programada sin -UpdaterVerbose cambio: $($scheduled.Estado) $($scheduled.Detalle)"}
+
+# Recoleccion de logs: solo los recientes, estado de tareas GenIT y carpeta por equipo.
+$logDir=Join-Path $testRoot 'Logs'; New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $logDir 'Actualizar-20261027_230000.log') -Value 'reciente'
+$old=Join-Path $logDir 'Actualizar-20261001_230000.log'; Set-Content -LiteralPath $old -Value 'viejo'; (Get-Item -LiteralPath $old).LastWriteTime=(Get-Date).AddDays(-20)
+$localLogs=Join-Path $testRoot 'Recolectados'
+$collected=Get-UpdaterRemoteLogs -Target 'srv01.example.local' -DomainCredential $credential -DestinationFolder $testRoot -LocalFolder $localLogs -Hours 24
+if($collected.Estado -ne 'En ejecucion' -or $collected.Logs -ne 1){throw "Recoleccion incorrecta: $($collected.Estado) $($collected.Logs) $($collected.Detalle)"}
+if((Get-Content -LiteralPath (Join-Path $localLogs 'srv01.example.local\Actualizar-20261027_230000.log') -Raw).Trim() -ne 'reciente'){throw 'Log no copiado'}
+if(-not ($collected.Tareas -match "^$([regex]::Escape($now.Tarea)): Running")){throw "Estado de tareas incompleto: $($collected.Tareas -join ' / ')"}
+if((Get-UpdaterRemoteLogs -Target 'unreachable' -DomainCredential $credential -DestinationFolder $testRoot -LocalFolder $localLogs -Hours 24).Estado -ne 'Error'){throw 'No se informo el equipo inaccesible al recolectar'}
+'PASS: fechas, validacion, copia, hash, tarea unica SYSTEM, actualizacion con tarea propia existente, proteccion de tareas ajenas o en ejecucion, copias existentes en otras carpetas, ejecucion inmediata con -Verbose, recoleccion de logs y error WinRM; sin conexiones reales.'
