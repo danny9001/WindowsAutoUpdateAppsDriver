@@ -2,4 +2,4 @@
 - [x] Descubrir copias por tareas y actualizarlas.
 - [x] Pruebas (pwsh y Windows PowerShell 5.1) y documentacion.
 - [x] Confirmacion y subida.
-- [ ] Verificar en los servidores reales (LPZVMAD01: C:\Medios).
+- [x] Verificar en los servidores reales (2026-10-27): 6/6 Actualizado; C:\Medios actualizada en lpzvmad01, lpzvmad02 y lpzvmpr02.
