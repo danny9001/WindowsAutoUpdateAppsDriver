@@ -5,7 +5,7 @@ $file = Join-Path (Split-Path $PSScriptRoot -Parent) 'UpdateAppsDrivers8.1.ps1'
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($file, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-foreach ($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Read-UpdaterYesNo','Configure-UpdaterScheduledTask','Confirm-WinGetInstallation')}, $true)) {
+foreach ($definition in $ast.FindAll({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @('Read-UpdaterYesNo','Configure-UpdaterScheduledTask','Get-UpdaterTaskName','Register-UpdaterScheduledTask','Confirm-WinGetInstallation')}, $true)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 function Write-Info($msg) {}

@@ -1677,23 +1677,10 @@ function Configure-UpdaterScheduledTask {
         return
     }
     try {
-        $scriptPath = $script:UpdaterScriptPath
-        if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath)) { throw 'Se requiere ejecutar el script desde un archivo guardado.' }
-        $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
-        try { $pathHash = [BitConverter]::ToString($hashAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($scriptPath.ToLowerInvariant()))).Replace('-', '').Substring(0, 12) }
-        finally { $hashAlgorithm.Dispose() }
-        $taskName = "UpdateAppsDrivers8.1-$pathHash"
+        $taskName = Get-UpdaterTaskName
         $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if (-not $configuredSchedule -and $existing -and -not (Read-UpdaterYesNo "La tarea $taskName ya existe. Desea reemplazar su horario?")) { return }
-        $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
-        if (-not (Test-Path -LiteralPath $pwshPath)) {
-            $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-            if (-not $command) { throw 'PowerShell 7 debe estar instalado antes de programar la tarea.' }
-            $pwshPath = $command.Source
-        }
-
         $days = @('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
-        $dayNames = @('Lunes','Martes','Miercoles','Jueves','Viernes','Sabado','Domingo')
         if ($configuredSchedule) {
             $day = [array]::IndexOf($days, [string]$script:UpdaterConfig.Schedule.DayOfWeek) + 1
             $time = $script:UpdaterConfig.Schedule.Time
@@ -1702,34 +1689,123 @@ function Configure-UpdaterScheduledTask {
         do { $day = (Read-Host 'Seleccione el dia (1-7)').Trim() } while ($day -notmatch '^[1-7]$')
         do { $time = (Read-Host 'Hora local del equipo en formato HH:mm (ejemplo 22:30)').Trim() } while ($time -notmatch '^([01][0-9]|2[0-3]):[0-5][0-9]$')
         }
-        $at = [datetime]::Today.Add([TimeSpan]::ParseExact($time, 'hh\:mm', [Globalization.CultureInfo]::InvariantCulture))
-        Write-Info "La tarea se ejecutara como SYSTEM cada $($dayNames[[int]$day - 1]) a las $time, con instalacion automatica de WinGet si falta."
-        $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScheduledRun -OutputFolder "{1}"' -f $scriptPath, $OutputFolder.TrimEnd('\')
-        # Leer SkipStore del JSON en cada ejecucion, sin fijarlo en los argumentos de la tarea.
-        if ($IncludePinned) { $arguments += ' -IncludePinned' }
-        if ($IncludeUnknown) { $arguments += ' -IncludeUnknown' }
-        if ($AllowReinstall) { $arguments += ' -AllowReinstall' }
-        if ($ExcludeIds.Count -gt 0) { $arguments += (' -ExcludeIds "{0}"' -f ($ExcludeIds -join ',')) }
-        $arguments += " -RebootPolicy $RebootPolicy -LogRetentionDays $LogRetentionDays"
-        $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $arguments -WorkingDirectory (Split-Path -Parent $scriptPath) -ErrorAction Stop
-        $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $days[[int]$day - 1] -At $at -ErrorAction Stop
-        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest -ErrorAction Stop
-        $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
-            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable `
-            -ExecutionTimeLimit (New-TimeSpan -Hours 4) -ErrorAction Stop
-        $registration = @{ TaskName=$taskName; Action=$action; Trigger=$trigger; Principal=$principal; Settings=$settings; Description="Actualizaciones semanales de aplicaciones y drivers: $scriptPath"; ErrorAction='Stop' }
-        if ($existing) { $registration.Force = $true }
-        Register-ScheduledTask @registration | Out-Null
-        $script:UpdaterConfig.SkipStore = [bool]$SkipStore
-        if (-not $configuredSchedule) {
-            $script:UpdaterConfig.Schedule.Enabled = $true
-            $script:UpdaterConfig.Schedule.DayOfWeek = $days[[int]$day - 1]
-            $script:UpdaterConfig.Schedule.Time = $time
-            $script:UpdaterConfig.AskQuestions = $false
-        }
+        Register-UpdaterScheduledTask -DayOfWeek $days[[int]$day - 1] -Time $time -Replace:([bool]$existing) | Out-Null
+        if (-not $configuredSchedule) { $script:UpdaterConfig.AskQuestions = $false }
         Save-UpdaterConfiguration
-        Write-Ok "Tarea $taskName creada: $($dayNames[[int]$day - 1]) a las $time (horario local). Conserve el script en $scriptPath."
     } catch { Write-ErrMsg "No se pudo crear la tarea programada: $($_.Exception.Message)" }
+}
+
+function Get-UpdaterTaskName {
+    # Un nombre por ruta del script: varias copias de la 8.1 en un equipo no se pisan.
+    $scriptPath = $script:UpdaterScriptPath
+    if (-not $scriptPath -or -not (Test-Path -LiteralPath $scriptPath)) { throw 'Se requiere ejecutar el script desde un archivo guardado.' }
+    $hashAlgorithm = [Security.Cryptography.SHA256]::Create()
+    try { $pathHash = [BitConverter]::ToString($hashAlgorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($scriptPath.ToLowerInvariant()))).Replace('-', '').Substring(0, 12) }
+    finally { $hashAlgorithm.Dispose() }
+    return "UpdateAppsDrivers8.1-$pathHash"
+}
+
+function Register-UpdaterScheduledTask {
+    # Registra la tarea semanal de esta copia y guarda el horario en el JSON (sin escribir el archivo).
+    param([string]$DayOfWeek, [string]$Time, [switch]$Replace)
+    $scriptPath = $script:UpdaterScriptPath
+    $taskName = Get-UpdaterTaskName
+    $pwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe'
+    if (-not (Test-Path -LiteralPath $pwshPath)) {
+        $command = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+        if (-not $command) { throw 'PowerShell 7 debe estar instalado antes de programar la tarea.' }
+        $pwshPath = $command.Source
+    }
+    $days = @('Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
+    $dayNames = @('Lunes','Martes','Miercoles','Jueves','Viernes','Sabado','Domingo')
+    $dayName = $dayNames[[array]::IndexOf($days, $DayOfWeek)]
+    $at = [datetime]::Today.Add([TimeSpan]::ParseExact($Time, 'hh\:mm', [Globalization.CultureInfo]::InvariantCulture))
+    Write-Info "La tarea se ejecutara como SYSTEM cada $dayName a las $Time, con instalacion automatica de WinGet si falta."
+    $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -ScheduledRun -OutputFolder "{1}"' -f $scriptPath, $OutputFolder.TrimEnd('\')
+    # Leer SkipStore del JSON en cada ejecucion, sin fijarlo en los argumentos de la tarea.
+    if ($IncludePinned) { $arguments += ' -IncludePinned' }
+    if ($IncludeUnknown) { $arguments += ' -IncludeUnknown' }
+    if ($AllowReinstall) { $arguments += ' -AllowReinstall' }
+    if ($ExcludeIds.Count -gt 0) { $arguments += (' -ExcludeIds "{0}"' -f ($ExcludeIds -join ',')) }
+    $arguments += " -RebootPolicy $RebootPolicy -LogRetentionDays $LogRetentionDays"
+    $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $arguments -WorkingDirectory (Split-Path -Parent $scriptPath) -ErrorAction Stop
+    $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $DayOfWeek -At $at -ErrorAction Stop
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest -ErrorAction Stop
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
+        -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 4) -ErrorAction Stop
+    $registration = @{ TaskName=$taskName; Action=$action; Trigger=$trigger; Principal=$principal; Settings=$settings; Description="Actualizaciones semanales de aplicaciones y drivers: $scriptPath"; ErrorAction='Stop' }
+    if ($Replace) { $registration.Force = $true }
+    Register-ScheduledTask @registration | Out-Null
+    $script:UpdaterConfig.SkipStore = [bool]$SkipStore
+    $script:UpdaterConfig.Schedule.Enabled = $true
+    $script:UpdaterConfig.Schedule.DayOfWeek = $DayOfWeek
+    $script:UpdaterConfig.Schedule.Time = $Time
+    Write-Ok "Tarea $taskName creada: $dayName a las $Time (horario local). Conserve el script en $scriptPath."
+    return $taskName
+}
+
+function Get-LegacyUpdaterTasks {
+    # Tareas de versiones anteriores: DailyUpdateAppsDrivers (CreateTask.ps1) o acciones hacia UpdateAppsDrivers*.ps1 que no son la 8.1.
+    @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+        $task = $_
+        if ($task.TaskName -eq 'DailyUpdateAppsDrivers') { return $true }
+        foreach ($action in @($task.Actions)) {
+            foreach ($match in [regex]::Matches("$($action.Execute) $($action.Arguments)", '(?i)UpdateAppsDrivers[\w.\-]*\.ps1')) {
+                if ($match.Value -ine 'UpdateAppsDrivers8.1.ps1') { return $true }
+            }
+        }
+        return $false
+    })
+}
+
+function Get-LegacyTaskSchedule {
+    # Semanal con un dia: ese dia y hora. Diaria u otra: su hora con el dia del JSON, porque el uso acordado es semanal.
+    param([object]$Task)
+    $days = @('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday')
+    $trigger = @($Task.Triggers | Where-Object { $_.StartBoundary }) | Select-Object -First 1
+    $day = [string]$script:UpdaterConfig.Schedule.DayOfWeek
+    $time = [string]$script:UpdaterConfig.Schedule.Time
+    if ($trigger) {
+        $start = [datetime]::MinValue
+        if ([datetime]::TryParse([string]$trigger.StartBoundary, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$start)) { $time = $start.ToString('HH:mm') }
+        # DaysOfWeek de MSFT_TaskWeeklyTrigger es una mascara: domingo=1, lunes=2 ... sabado=64.
+        $mask = [int]$trigger.DaysOfWeek
+        $selected = @(0..6 | Where-Object { $mask -band (1 -shl $_) })
+        if ($selected.Count -eq 1) { $day = $days[$selected[0]] }
+    }
+    return [pscustomobject]@{ DayOfWeek=$day; Time=$time }
+}
+
+function Invoke-LegacyTaskMigration {
+    # Crea (o conserva) la tarea de la 8.1, la verifica y despues elimina las tareas de versiones anteriores.
+    if (-not (Test-IsAdmin)) { return }
+    try { $legacy = @(Get-LegacyUpdaterTasks) } catch { Write-WarnMsg "No se pudieron revisar tareas anteriores: $($_.Exception.Message)"; return }
+    if ($legacy.Count -eq 0) { return }
+    Write-WarnMsg ("⚠️ Tareas de versiones anteriores del script: {0}" -f (($legacy | ForEach-Object { "$($_.TaskPath)$($_.TaskName)" }) -join ', '))
+    try {
+        $taskName = Get-UpdaterTaskName
+        $current = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($DryRun) {
+            $plan = if ($current) { "se conservaria $taskName" } else { $schedule = Get-LegacyTaskSchedule -Task $legacy[0]; "se crearia $taskName ($($schedule.DayOfWeek) $($schedule.Time))" }
+            Write-Info "    DryRun: $plan y se eliminarian las tareas anteriores."
+            return
+        }
+        if (-not $current) {
+            $schedule = Get-LegacyTaskSchedule -Task $legacy[0]
+            Register-UpdaterScheduledTask -DayOfWeek $schedule.DayOfWeek -Time $schedule.Time | Out-Null
+            Save-UpdaterConfiguration
+            if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) { throw "no se encontro $taskName despues de crearla" }
+        }
+        foreach ($task in $legacy) {
+            Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -ErrorAction Stop
+            Write-Ok "✅ Tarea anterior eliminada: $($task.TaskPath)$($task.TaskName)"
+            $script:Successes.Add("Tarea anterior migrada: $($task.TaskName)")
+        }
+    } catch {
+        $script:Failures.Add("Migracion de tareas anteriores: $($_.Exception.Message)")
+        Write-ErrMsg "❌ No se migraron las tareas anteriores (se conservan): $($_.Exception.Message)"
+    }
 }
 
 # -------------------------
@@ -1771,6 +1847,7 @@ if (Get-PendingReboot) { Write-WarnMsg "⚠️ Ya hay un reinicio pendiente ante
 
 # Flujo de actualización
 Configure-UpdaterScheduledTask
+Invoke-LegacyTaskMigration
 Update-RuckZuckApps
 Update-WinGetApps
 Update-MicrosoftStore

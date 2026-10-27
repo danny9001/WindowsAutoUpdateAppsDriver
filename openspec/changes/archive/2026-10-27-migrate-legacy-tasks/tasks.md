@@ -1,0 +1,6 @@
+- [x] Revisar tareas que creaban las versiones anteriores y decidir con el usuario (solo migrar; eliminar la antigua).
+- [x] Extraer Register-UpdaterScheduledTask de Configure-UpdaterScheduledTask.
+- [x] Detectar tareas antiguas y obtener su horario.
+- [x] Migrar: crear o conservar la tarea 8.1, verificar y eliminar las antiguas; DryRun solo lista.
+- [x] Pruebas simuladas y ejecucion de todas las pruebas (8 PASS); deteccion real de solo lectura en DIMA-DLANDIVAR1: 330 tareas, 0 antiguas.
+- [x] Actualizar README y CONFIGURACION; confirmacion y subida.

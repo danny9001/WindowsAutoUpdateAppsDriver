@@ -60,7 +60,7 @@ At the end it prints a summary (successful / skipped / with problems / reboot pe
 
 ## Scheduled task
 
-On the first interactive run the script offers to create a weekly task (`UpdateAppsDrivers8.1-<hash>`) that runs as SYSTEM at the day and time you choose. It runs on battery, only if the network is available, and has a 4-hour limit. Once it exists the script does not ask again; use `-ReconfigureTask` to change it. Keep the script in the same path the task points to.
+On the first interactive run the script offers to create a weekly task (`UpdateAppsDrivers8.1-<hash>`) that runs as SYSTEM at the day and time you choose. It runs on battery, only if the network is available, and has a 4-hour limit. Once it exists the script does not ask again; use `-ReconfigureTask` to change it. Keep the script in the same path the task points to. Tasks left by earlier versions (`DailyUpdateAppsDrivers` or actions running `UpdateAppsDrivers3/7.x/8/Silence.ps1`) are replaced: the 8.1 task is created with the same day and time, verified, and then the old tasks are deleted.
 
 ## Logs and safety
 
@@ -144,7 +144,7 @@ Al final imprime un resumen (correctos / omitidos / con problemas / reinicio pen
 
 ## Tarea programada
 
-En la primera ejecución interactiva el script ofrece crear una tarea semanal (`UpdateAppsDrivers8.1-<hash>`) que corre como SYSTEM el día y la hora que elija. Funciona con batería, solo si hay red y tiene un límite de 4 horas. Una vez creada no vuelve a preguntar; use `-ReconfigureTask` para modificarla. Conserve el script en la misma ruta a la que apunta la tarea.
+En la primera ejecución interactiva el script ofrece crear una tarea semanal (`UpdateAppsDrivers8.1-<hash>`) que corre como SYSTEM el día y la hora que elija. Funciona con batería, solo si hay red y tiene un límite de 4 horas. Una vez creada no vuelve a preguntar; use `-ReconfigureTask` para modificarla. Conserve el script en la misma ruta a la que apunta la tarea. Las tareas que dejaron versiones anteriores (`DailyUpdateAppsDrivers` o acciones que ejecutan `UpdateAppsDrivers3/7.x/8/Silence.ps1`) se reemplazan: se crea la tarea de la 8.1 con el mismo día y hora, se verifica y luego se eliminan las anteriores.
 
 ## Logs y seguridad
 
